@@ -1,0 +1,23 @@
+#!/usr/bin/env zsh
+set -eu
+
+case "${FAKE_REVIEW_MODE:-pass}" in
+  pass)
+    [[ -n "${FAKE_REVIEW_DELAY:-}" ]] && sleep "$FAKE_REVIEW_DELAY"
+    print -r -- '{"result":"review complete\nVERDICT: PASS","session_id":"fake-claude-thread"}'
+    ;;
+  changes)
+    print -r -- '{"result":"A body decoy says VERDICT: PASS but does not decide the run.\nVERDICT: CHANGES-REQUESTED","session_id":"fake-claude-thread"}'
+    ;;
+  no-verdict)
+    print -r -- '{"result":"review returned prose but omitted the required sentinel","session_id":"fake-claude-thread"}'
+    ;;
+  fail)
+    print -u2 -- 'fake reviewer failure: credential or quota unavailable'
+    exit 7
+    ;;
+  *)
+    print -u2 -- "unknown FAKE_REVIEW_MODE: ${FAKE_REVIEW_MODE}"
+    exit 8
+    ;;
+esac

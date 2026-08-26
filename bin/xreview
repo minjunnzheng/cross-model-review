@@ -1,0 +1,820 @@
+#!/usr/bin/env zsh
+# xreview — cross-model review loop (you are the author, another model family reviews,
+# one reviewer thread throughout, exchange after exchange until consensus)
+#
+#   Which engine reviews is configurable — see XREVIEW_REVIEWER below. The only rule the
+#   tool enforces is that author and reviewer must not be the same family: reviewing your
+#   own work with your own brain is what this exists to prevent.
+#
+#   Core design (how it differs from ai-duel):
+#     ai-duel = one-shot, fixed three rounds, cold start every round, outputs a "who is right" verdict.
+#     xreview = iterative convergence, no round limit, one single codex session (thread) all the
+#               way through, and only one criterion for passing: consensus. The marker is
+#               stamped only once it passes.
+#     Why the same thread matters: a cold-started reviewer invents a fresh batch of small nits
+#     every round, so the list never ends -> over-engineering. A reviewer in the same thread
+#     remembers what it said last round: round 1 catches the real problems, later rounds verify
+#     the fixes, and the loop converges.
+#
+#   A round takes 3–15 minutes and prints nothing until it returns. Wait for it: if the
+#   caller gives up early the reviewer is orphaned and the session is left with a blank
+#   verdict that looks just like "the reviewer said nothing". `xreview status` shows the
+#   round's state (RUNNING / INCOMPLETE / done / failed) so that case cannot be misread.
+#
+#   Usage:
+#     xreview start [--label NAME] [--reviewer ENGINE[:MODEL]] [-m MODEL] [-i IMAGE]... plan.md
+#                                                        # open the review (round 1); -i may repeat
+#                                                        # ENGINE: codex | claude | grok — pinned into the session
+#                                                        # e.g. --reviewer grok:grok-4.6, --reviewer claude:opus
+#     xreview start -                                    # read the material under review from stdin
+#     xreview round --session DIR "fixed A and B; pushing back on C, because..."
+#                                                        # send the author reply, go to the next round
+#     xreview round --session DIR [-i new-shot]... -     # read the reply from stdin (use this for long text)
+#     xreview status --session DIR                       # session / rounds / verdict / state
+#     xreview log --session DIR                          # print every round
+#     xreview stamp --session DIR                        # after PASS, stamp the exact reviewed bytes
+#     xreview check plan.md                              # marker at end of file -> exit 0 (for the stop hook)
+#
+#   Environment variables:
+#     XREVIEW_REVIEWER      reviewer engine: codex | claude | grok (--reviewer on start overrides;
+#                           default: claude when running inside a Codex sandbox, else codex)
+#     XREVIEW_AUTHOR        explicit author family: codex | claude | grok (overrides detection)
+#     XREVIEW_CODEX_MODEL   reviewer model when the reviewer is codex (default: codex's own)
+#     XREVIEW_CLAUDE_MODEL  reviewer model when the reviewer is claude (default: opus)
+#     XREVIEW_GROK_MODEL    reviewer model when the reviewer is grok (default: grok-4.6)
+#     XREVIEW_TIMEOUT       per-round timeout in seconds (default 900)
+#     XREVIEW_SESSION       session directory to use instead of --session
+#     XREVIEW_LANG          language the reviewer answers in (falls back to AI_LANG; default en)
+#     XREVIEW_ALLOW_SELF    set to 1 to allow the author's own family to review (off by default)
+set -euo pipefail
+
+TO="${XREVIEW_TIMEOUT:-900}"
+ROOT=".xreview"
+
+die() { print -u2 "✗ $*"; exit 1; }
+
+# Captured at top level: inside a function zsh sets $0 to the function name
+# (FUNCTION_ARGZERO is on by default), so usage() reading "$0" would look for a
+# file literally called "usage" and die instead of printing the help.
+SELF="${0:A}"
+
+usage() {
+  # Print the whole header comment: from line 2 down to (excluding) the set -euo line,
+  # so editing the header cannot silently truncate the help the way a fixed line
+  # range once did.
+  sed -n '2,/^set -euo/p' "$SELF" | sed '$d' | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+require_tools() {
+  local tool missing=()
+  for tool in "$@"; do
+    command -v "$tool" > /dev/null 2>&1 || missing+=("$tool")
+  done
+  (( ${#missing} == 0 )) || die "Missing required command(s): ${missing[*]}"
+}
+
+# ── Output language ──────────────────────────────────────────────
+# The reviewer model answers in this language. English by default.
+# Set AI_LANG (or the per-tool override XREVIEW_LANG) to switch, e.g. AI_LANG=zh-TW
+case "${XREVIEW_LANG:-${AI_LANG:-en}}" in
+  ""|en|en-*|english)          LANG_RULE="Answer in English." ;;
+  zh-TW|zh_TW|zh-Hant|zh)      LANG_RULE="一律以繁體中文（台灣用語）回答。" ;;
+  *)                           LANG_RULE="Answer in ${XREVIEW_LANG:-${AI_LANG}}." ;;
+esac
+
+# ── Reviewer engine ───────────────────────────────────────────────
+# Every valid author/reviewer family. Adding an engine = its name here, a
+# parse_reply_<name> parser, and an engine_start_<name> / engine_resume_<name>
+# pair in the engine registry below (plus a model default in eff_model).
+ENGINES=(codex claude grok)
+
+# These variables only exist in a shell the agent itself started, so they identify the
+# author's family: CODEX_SANDBOX / CODEX_THREAD_ID = codex, GROK_AGENT = grok,
+# CLAUDECODE = claude. The reviewer must be a different family — otherwise the whole
+# exercise degrades into one model marking its own homework.
+AUTHOR="${XREVIEW_AUTHOR:-}"
+if [[ -z "$AUTHOR" ]]; then
+  if   [[ -n "${CODEX_SANDBOX:-}${CODEX_THREAD_ID:-}" ]]; then AUTHOR=codex
+  elif [[ -n "${GROK_AGENT:-}" ]];                       then AUTHOR=grok
+  elif [[ -n "${CLAUDECODE:-}" ]];                       then AUTHOR=claude
+  fi
+fi
+[[ -z "$AUTHOR" || " ${ENGINES[*]} " == *" $AUTHOR "* ]] \
+  || die "XREVIEW_AUTHOR must be one of: ${ENGINES[*]} (got: $AUTHOR)"
+
+REVIEWER="${XREVIEW_REVIEWER:-}"
+if [[ -z "$REVIEWER" ]]; then
+  if [[ "$AUTHOR" == codex ]]; then REVIEWER=claude; else REVIEWER=codex; fi
+fi
+[[ " ${ENGINES[*]} " == *" $REVIEWER "* ]] \
+  || die "XREVIEW_REVIEWER must be one of: ${ENGINES[*]} (got: $REVIEWER)"
+
+# Both checks below belong to the commands that actually spawn a reviewer. status / log /
+# check / stamp touch no model at all, so a stale XREVIEW_REVIEWER in the environment must
+# not stop you from reading or stamping a session someone else's engine reviewed.
+assert_reviewer_usable() {   # assert_reviewer_usable <engine>
+  # Only refuse when the author is positively identified: an unknown author (a plain
+  # terminal) must not be blocked — the check fails open rather than guessing.
+  if [[ -n "$AUTHOR" && "$AUTHOR" == "$1" && -z "${XREVIEW_ALLOW_SELF:-}" ]]; then
+    die "The author is $AUTHOR, so $1 cannot be the reviewer — that is self-review, which is what this tool exists to prevent. Pick another engine (XREVIEW_REVIEWER=…), or set XREVIEW_ALLOW_SELF=1 if you really mean it."
+  fi
+  command -v "$1" > /dev/null 2>&1 \
+    || die "Reviewer CLI not found: $1 — install it, or pick an installed engine with XREVIEW_REVIEWER=codex|claude|grok"
+}
+
+# ── Reviewer charter: round 1 (raise the findings) ────────────────
+CHARTER_R1='You are the independent reviewer of this plan/proposal, and you come from a different model family. Your value is exactly the blind spots the author cannot see using the same brain. The author is not present; only the person in charge will read your findings.
+
+[Hard rules]
+1. No praise, no pleasantries, no summarising affirmations of any kind. Do not mention the strengths — the person in charge can see those without you.
+2. Do not hunt for problems in order to prove you are useful. If there is genuinely nothing wrong, just say PASS — letting it through is not a dereliction of duty. What you are asked for is real problems, not company.
+3. Do not demand over-engineering. Only "it produces wrong results, destroys data, or the plan cannot run at all" counts as BLOCKER; "it could be prettier / more general / more flexible" must never be written down at all.
+4. You have read-only file access. When in doubt, go and read the source code, the data files and the input files before you judge; do not file a finding on guesswork. For anything you cannot read, file it as "needs confirmation", not as a bug.
+5. Every finding uses this fixed format:
+   [BLOCKER|MAJOR|MINOR] one-line title
+   Location: file:line, or a quote from the plan (under 30 words)
+   Problem: why it breaks — be concrete about the failure case (what input / what state -> what wrong result)
+   Suggestion: the smallest fix that can be applied exactly as written
+6. The last line must be one of the following, with no other text before or after it:
+   VERDICT: PASS
+   VERDICT: CHANGES-REQUESTED
+
+[Mandatory checklist] (generic version. These are the classes of problem that get missed most often, so check them first;
+rewrite this section for your own field — put in the potholes you have actually stepped in and the hit rate goes up a lot)
+- Numbers that enter an analysis or a configuration (observations, weights, thresholds, coordinates, default parameters): is a source cited (literature reference including table and page number, absolute path of a data file, or user-provided + date)? A "reasonable default" with no source = BLOCKER.
+- Intermediate products are not ground truth. A constant that was hand-tuned to make a figure or to debug, consumed downstream as if it were the true value = BLOCKER.
+- Parameters and flags: does the program really read that parameter? Does the plan arrange to print the value actually in effect? When the result is insensitive to a parameter, the first suspicion is that the knob is not wired up, not that this is a real conclusion.
+- Preflight for expensive or irreversible runs: is the built artifact newer than every source file, is the working tree clean, does the run directory keep provenance (git SHA + diff + build time)?
+- The plan claims to guarantee something but never says by what concrete means — especially races, boundary conditions, concurrency, empty input, unit conversion, and coordinate/reference-frame transforms.
+- Terminology: are there invented translations or invented definitions instead of the established term the field already uses?
+
+Start reviewing now.'
+
+# ── Reviewer charter: round 2 onward (verification) ───────────────
+CHARTER_RN='This is a verification round, not a fresh round of new findings.
+
+1. Work through every item you raised last round, point by point, and mark each one as exactly one of:
+   resolved / not resolved (say concretely what is still missing) / withdrawn (I am convinced, the author is right)
+2. A new problem may only be raised when both conditions hold: (a) it is BLOCKER level, and (b) you can explain why you did not see it last round. Everything else stays unwritten — you have already read this plan, so inventing new small nits is over-engineering.
+3. For items you stand by: say exactly what you are standing by, and why the justification given by the author does not hold. A vague insistence counts as giving it up.
+4. If no BLOCKER or MAJOR is left unresolved, give PASS. Do not hold the gate to look strict, and do not wave it through just to end the conversation — those two are equally bad.
+5. Last line as before: it may contain nothing but "VERDICT: PASS" or "VERDICT: CHANGES-REQUESTED".
+
+Below is the reply from the author.'
+
+# The language rule is appended rather than embedded, so the charter text above stays one
+# quoted block that is safe to edit without worrying about interpolation.
+CHARTER_R1="$CHARTER_R1"$'\n\n'"$LANG_RULE"
+CHARTER_RN="$CHARTER_RN"$'\n\n'"$LANG_RULE"
+
+# ── Reply parsers: one per engine, common contract ────────────────
+# parse_reply_<engine> <raw> <out-reply.md> — write the reply text to <out>,
+# print the thread id on stdout, token usage on stderr.
+parse_reply_codex() {   # codex --json emits JSONL events
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+src, out = sys.argv[1], sys.argv[2]
+thread, msgs, usage = "", [], None
+for line in open(src, encoding="utf-8"):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    t = d.get("type")
+    if t == "thread.started":
+        thread = d.get("thread_id", "")
+    elif t == "item.completed" and d.get("item", {}).get("type") == "agent_message":
+        msgs.append(d["item"].get("text", ""))
+    elif t == "turn.completed":
+        usage = d.get("usage")
+open(out, "w", encoding="utf-8").write((msgs[-1] if msgs else "").rstrip() + "\n")
+print(thread)
+if usage:
+    print("tokens in=%s cached=%s out=%s" % (usage.get("input_tokens"),
+          usage.get("cached_input_tokens"), usage.get("output_tokens")), file=sys.stderr)
+PY
+}
+
+# claude -p --output-format json returns a single object; the reply is .result and the
+# thread id is .session_id. Shape differs from the codex JSONL above, so it needs its own
+# parser — same contract: write the reply to <out>, print the thread id on stdout.
+parse_reply_claude() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+src, out = sys.argv[1], sys.argv[2]
+raw = open(src, encoding="utf-8").read().strip()
+obj = None
+try:
+    obj = json.loads(raw)
+except Exception:
+    # Fallback: if we were handed stream-json (one object per line), take the last result
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") == "result":
+            obj = d
+if isinstance(obj, list):
+    obj = next((d for d in reversed(obj) if isinstance(d, dict) and d.get("type") == "result"), None)
+if not isinstance(obj, dict):
+    sys.exit("xreview: could not parse the claude output")
+text = obj.get("result") or ""
+open(out, "w", encoding="utf-8").write(text.rstrip() + "\n")
+print(obj.get("session_id", ""))
+u = obj.get("usage") or {}
+if u:
+    print("tokens in=%s cached=%s out=%s" % (u.get("input_tokens"),
+          u.get("cache_read_input_tokens"), u.get("output_tokens")), file=sys.stderr)
+PY
+}
+
+# grok --output-format json returns a single object; the reply is .text and the thread id
+# is .sessionId (verified against grok-4.6, Aug 2026). Same contract as the other parsers.
+parse_reply_grok() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+src, out = sys.argv[1], sys.argv[2]
+raw = open(src, encoding="utf-8").read().strip()
+try:
+    obj = json.loads(raw)
+except Exception:
+    sys.exit("xreview: could not parse the grok output")
+if not isinstance(obj, dict):
+    sys.exit("xreview: could not parse the grok output")
+open(out, "w", encoding="utf-8").write((obj.get("text") or "").rstrip() + "\n")
+print(obj.get("sessionId", ""))
+u = obj.get("usage") or {}
+if u:
+    print("tokens in=%s cached=%s out=%s" % (u.get("input_tokens"),
+          u.get("cache_read_input_tokens"), u.get("output_tokens")), file=sys.stderr)
+PY
+}
+
+parse_reply() {   # parse_reply <raw> <out-reply.md> ; prints the thread id
+  parse_reply_$REVIEWER "$@"
+}
+
+# Note on attached images: without this block the reviewer usually treats the images as
+# decoration. The filename is the caption, so give image files meaningful names
+# (e.g. shot-desktop-1440.png, shot-ipad-1024.png, shot-field-form.png).
+img_note() {
+  print -r -- "────────── Attached images (the actual rendered screens) ──────────"
+  local i=1
+  for f in "$@"; do
+    print -r -- "Image $i: ${f:t}"
+    (( i++ ))
+  done
+  print -r -- ""
+  print -r -- "These are screens of the thing actually running, not source code. Include visual and layout problems in the review, and pick only the ones that genuinely get in the way of use: cramped or overlapping layout, overflow, insufficient text contrast, touch targets that are too small (<44px), broken line wrapping, key information folded outside the window, layouts that break at other widths. Do not write down pure aesthetic preferences (whether the colour scheme is pretty, how big the corner radius is)."
+  print -r -- "When an image and the source code disagree, the image wins — the image is the fact, the source code is the intent."
+}
+
+# codex takes images with -i; claude and grok have no such flag, so the paths are handed
+# over in the prompt for the reviewer to open with its own file-read tool instead.
+path_img_block() {
+  print -r -- ""
+  print -r -- "────────── Attached images (open each of these absolute paths with your file-read tool) ──────────"
+  for f in "$@"; do print -r -- "$f"; done
+}
+
+verdict_of() {   # verdict_of <reply.md> → PASS / CHANGES / UNKNOWN
+  local f="$1" last
+  last="$(awk 'NF { line=$0 } END { sub(/\r$/, "", line); print line }' "$f" 2>/dev/null || true)"
+  case "$last" in
+    'VERDICT: PASS')              print -r -- PASS ;;
+    'VERDICT: CHANGES-REQUESTED') print -r -- CHANGES ;;
+    *)                            print -r -- UNKNOWN ;;
+  esac
+}
+
+meta_get() { grep -m1 "^$2=" "$1/meta" 2>/dev/null | cut -d= -f2- || true; }
+meta_set() {   # meta_set <sdir> <key> <val>
+  local f="$1/meta"
+  touch "$f"
+  grep -v "^$2=" "$f" > "$f.tmp" 2>/dev/null || true
+  print -r -- "$2=$3" >> "$f.tmp"
+  mv "$f.tmp" "$f"
+}
+
+# ── Round liveness ───────────────────────────────────────────────
+# A round takes minutes and every engine writes its reply to a file, so nothing appears
+# on the terminal until it is over. A caller that gives up early (Codex's exec_command
+# yields after ~30 s and reports "Script running with cell ID N") then sees a session
+# with no verdict and reads it as "the reviewer returned nothing" — and starts a second
+# session, orphaning the first. Observed in practice: two reviews abandoned ~10 s in,
+# both killed mid-work, both leaving a 0-byte raw-r1.jsonl. So a round records its state and pid,
+# and `status` says out loud whether that process is still alive.
+XR_ACTIVE=""
+
+round_begin() {   # round_begin <sdir> <round-number>
+  XR_ACTIVE="$1"
+  meta_set "$1" state "running-r$2"
+  meta_set "$1" pid "$$"
+  meta_set "$1" started "$(date +%s)"
+  meta_set "$1" finished ""
+}
+
+round_end() {     # round_end <sdir> <done|failed|aborted>
+  meta_set "$1" state "$2"
+  meta_set "$1" finished "$(date +%s)"
+  XR_ACTIVE=""
+}
+
+# Any exit while a round is in flight — die, `set -e`, a failed parse — is a failed
+# round, never a silent empty one. SIGKILL cannot be caught; that case is what the
+# liveness check in state_line() is for.
+TRAPEXIT() {
+  [[ -n "$XR_ACTIVE" ]] || return 0
+  [[ "$(meta_get "$XR_ACTIVE" state)" == running-* ]] || return 0
+  round_end "$XR_ACTIVE" failed
+}
+TRAPTERM() { [[ -n "$XR_ACTIVE" ]] && round_end "$XR_ACTIVE" aborted; exit 143 }
+TRAPINT()  { [[ -n "$XR_ACTIVE" ]] && round_end "$XR_ACTIVE" aborted; exit 130 }
+
+hms() { print -r -- "$(( $1 / 60 ))m$(( $1 % 60 ))s"; }
+
+state_line() {    # state_line <sdir> → is this session live, finished, or dead?
+  local sdir="$1" st pid started finished now el
+  st="$(meta_get "$sdir" state)"
+  [[ -n "$st" ]] || { print -r -- "unknown (session predates state tracking)"; return 0 }
+  pid="$(meta_get "$sdir" pid)"
+  started="$(meta_get "$sdir" started)"
+  finished="$(meta_get "$sdir" finished)"
+  now="$(date +%s)"
+  case "$st" in
+    running-*)
+      el="$(hms $(( now - ${started:-$now} )))"
+      if [[ -n "$pid" ]] && ps -p "$pid" -o command= 2>/dev/null | grep -q xreview; then
+        print -r -- "RUNNING — ${st#running-} in flight (pid $pid, elapsed $el). A round takes 3–15 min; wait for that command to finish. Do NOT start a second session."
+      else
+        print -r -- "INCOMPLETE — ${st#running-} was killed before it returned (pid ${pid:-?} is gone, $el after it started). The empty verdict is NOT a review result; re-run the round and let it finish."
+      fi ;;
+    done)
+      el=""; [[ -n "$started" && -n "$finished" ]] && el=" in $(hms $(( finished - started )))"
+      print -r -- "done — round $(meta_get "$sdir" rounds) came back$el" ;;
+    failed)
+      print -r -- "FAILED — the reviewer engine errored out; see $sdir/err-r*.txt" ;;
+    aborted)
+      print -r -- "ABORTED — interrupted mid-round; the verdict is not a review result. Re-run the round." ;;
+    *) print -r -- "$st" ;;
+  esac
+}
+
+cur_session() {
+  local s="${SESSION_CLI:-${XREVIEW_SESSION:-}}"
+  [[ -n "$s" ]] || die "Session required. Pass --session <run-directory> or set XREVIEW_SESSION."
+  [[ -d "$s" ]] || die "Session directory not found: $s"
+  print -r -- "${s:A}"
+}
+
+marker_line() {   # marker_line <sdir> <sha256> <separator-added:0|1>
+  local sdir="$1" digest="$2" sep="$3" m
+  m="$(meta_get "$sdir" model)"; [[ -n "$m" ]] || m="unknown"   # older sessions did not record the model
+  local r; r="$(meta_get "$sdir" reviewer)"; [[ -n "$r" ]] || r="codex"   # ditto for the engine
+  print -r -- "XREVIEW-PASS reviewer=$r/$m date=$(date +%Y-%m-%d) rounds=$(meta_get "$sdir" rounds) thread=$(meta_get "$sdir" thread) sha256=$digest sep=$sep"
+}
+
+sha256_file() {
+  python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+}
+
+needs_separator() {
+  python3 -c 'import sys; b=open(sys.argv[1], "rb").read(); print(0 if b.endswith(b"\n") else 1)' "$1"
+}
+
+marker_valid() {   # marker_valid <file>; PASS and SKIP are both success
+  # Failure says why on stderr: the exit code alone cannot distinguish "never
+  # reviewed" from "stale PASS", and both callers (check, the Stop hook docs)
+  # send a human here to find out what to do next.
+  python3 - "$1" <<'PY'
+import hashlib, re, sys
+
+path = sys.argv[1]
+
+def fail(msg):
+    print("xreview check: %s: %s" % (path, msg), file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    raw = open(path, "rb").read()
+except OSError as e:
+    fail("cannot read file (%s)" % (e.strerror or e))
+lines = raw.splitlines(keepends=True)
+if not lines:
+    fail("file is empty — no marker")
+last = lines[-1].rstrip(b"\r\n").decode("utf-8", "replace")
+if re.match(r"^(?:<!--\s*|//\s*|#\s*|!\s*)?XREVIEW-SKIP\b", last):
+    raise SystemExit(0)
+if not re.match(r"^(?:<!--\s*|//\s*|#\s*|!\s*)?XREVIEW-PASS\b", last):
+    fail("final line carries no XREVIEW-PASS or XREVIEW-SKIP marker")
+digest = re.search(r"\bsha256=([0-9a-f]{64})\b", last)
+sep = re.search(r"\bsep=([01])\b", last)
+if not digest or not sep:
+    fail("marker is malformed (missing sha256= or sep= field)")
+prefix = b"".join(lines[:-1])
+if sep.group(1) == "1":
+    if not prefix.endswith(b"\n"):
+        fail("content changed after stamping (separator newline missing)")
+    prefix = prefix[:-1]
+if hashlib.sha256(prefix).hexdigest() != digest.group(1):
+    fail("content changed after stamping (sha256 mismatch — the PASS is stale; run another round and re-stamp)")
+raise SystemExit(0)
+PY
+}
+
+make_session_dir() {
+  local label="$1" base candidate attempt
+  mkdir -p "$ROOT"
+  base="$ROOT/$(date +%Y%m%d-%H%M%S)${label:+-$label}"
+  candidate="$base"
+  for attempt in {0..20}; do
+    if mkdir "$candidate" 2>/dev/null; then
+      print -r -- "${candidate:A}"
+      return 0
+    fi
+    candidate="${base}-$$-${RANDOM}-${attempt}"
+  done
+  die "Could not create a unique session directory under $ROOT"
+}
+
+# The reviewer model actually in effect: -m wins, otherwise read codex's own default
+# (~/.codex/config.toml). It goes into the marker for provenance — six months from now,
+# when you find a stamped plan, you need to know who reviewed it.
+eff_model() {
+  local m="${1:-}"
+  if [[ -z "$m" ]]; then
+    if [[ "$REVIEWER" == claude ]]; then
+      m="${XREVIEW_CLAUDE_MODEL:-opus}"
+    elif [[ "$REVIEWER" == grok ]]; then
+      m="${XREVIEW_GROK_MODEL:-grok-4.6}"
+    else
+      m="$(grep -m1 '^model[[:space:]]*=' "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null \
+           | sed -e 's/^[^=]*=[[:space:]]*//' -e 's/"//g' -e "s/'//g" || true)"
+    fi
+  fi
+  print -r -- "${m:-unknown}"
+}
+
+# ── Engine registry ───────────────────────────────────────────────
+# One start/resume arg-builder pair per engine; each sets CALL=(argv…). The caller
+# feeds the prompt on stdin ($PROMPT_FILE holds its path for engines that want a
+# file instead) and captures raw-rN.jsonl / err-rN.txt under the wall-clock cap.
+# Contract:
+#   engine_start_<name>  <effmodel> <raw-model> <img…>
+#   engine_resume_<name> <effmodel> <thread> <start-cwd> <img…>
+# Adding an engine = these two functions + parse_reply_<name> + its name in ENGINES
+# (+ a default in eff_model if it has a model env var).
+
+engine_start_codex() {
+  local eff="$1" raw="$2"; shift 2
+  CALL=(codex exec --skip-git-repo-check -s read-only --json)
+  [[ -n "$raw" ]] && CALL+=(-m "$raw")   # absent -m = codex's own default model
+  local f; for f in "$@"; do CALL+=(-i "$f"); done
+  CALL+=(-)
+}
+
+engine_resume_codex() {
+  local eff="$1" thread="$2"; shift 3   # exec resume has no -s; -c spells the same sandbox
+  CALL=(codex exec resume "$thread" --skip-git-repo-check -c sandbox_mode="read-only" --json)
+  local f; for f in "$@"; do CALL+=(-i "$f"); done
+  CALL+=(-)
+}
+
+engine_start_claude() {
+  local eff="$1"; shift 2
+  # claude has no thread id of its own until a session exists, so one is minted here
+  # and reused by --resume on later rounds (parse_reply_claude reports it back).
+  local sid; sid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  CALL=(claude -p --model "$eff" --session-id "$sid" --output-format json
+        --allowedTools Read Grep Glob --disallowedTools Write Edit NotebookEdit Bash)
+}
+
+engine_resume_claude() {
+  local eff="$1" thread="$2"; shift 3
+  CALL=(claude -p --resume "$thread" --model "$eff" --output-format json
+        --allowedTools Read Grep Glob --disallowedTools Write Edit NotebookEdit Bash)
+}
+
+engine_start_grok() {
+  local eff="$1"; shift 2
+  # grok mints its own session id and reports it back as .sessionId. It reads the prompt
+  # from a file rather than stdin. The shell stays available: the review is worth more
+  # when the reviewer can actually run a check, and --sandbox read-only already blocks
+  # writes. --always-approve keeps a headless run from hanging on a permission prompt.
+  # --cwd pins the session store so `round` finds the thread from any directory.
+  CALL=(grok --prompt-file "$PROMPT_FILE" -m "$eff" --cwd "$PWD"
+        --output-format json --sandbox read-only --always-approve
+        --disallowed-tools "write,edit,web_search,web_fetch" --max-turns 30)
+}
+
+engine_resume_grok() {
+  local eff="$1" thread="$2" scwd="$3"; shift 3
+  CALL=(grok --resume "$thread" --prompt-file "$PROMPT_FILE"
+        --output-format json --sandbox read-only --always-approve
+        --disallowed-tools "write,edit,web_search,web_fetch" --max-turns 30)
+  # grok stores sessions per working directory, so resume has to happen in the directory
+  # start ran in — otherwise the thread is invisible and every earlier round is lost.
+  [[ -n "$scwd" ]] && CALL+=(--cwd "$scwd")
+  return 0   # an empty scwd must not fail the function under set -e
+}
+
+run_reviewer() {   # run_reviewer <sdir> <round> <errmsg-prefix>; expects CALL and PROMPT_FILE set
+  local sdir="$1" round="$2" prefix="$3"
+  if ! perl -e 'alarm shift; exec @ARGV' "$TO" "${CALL[@]}" \
+      < "$PROMPT_FILE" > "$sdir/raw-r$round.jsonl" 2> "$sdir/err-r$round.txt"; then
+    backend_failed "$sdir" "$round" "$prefix failed or timed out"
+  fi
+}
+
+# UNKNOWN already blocks stamping (stamp only accepts PASS), so the safety property
+# holds either way. What it does not do is say *why*: a reviewer that ran out of quota
+# writes its provider's error where the review should be, and "verdict: UNKNOWN" alone
+# reads like the reviewer simply forgot the last line. Name the likely cause.
+backend_failed() {   # backend_failed <sdir> <round> <message>
+  local sdir="$1" round="$2" message="$3" f
+  print -u2 "✗ $message"
+  for f in "$sdir/err-r$round.txt" "$sdir/raw-r$round.jsonl"; do
+    print -u2 "── ${f:t} (last 20 lines)"
+    if [[ -s "$f" ]]; then tail -20 "$f" >&2; else print -u2 "(empty)"; fi
+  done
+  round_end "$sdir" failed
+  exit 1
+}
+
+reject_unknown_verdict() {   # reject_unknown_verdict <sdir> <round> <reply> <raw>
+  local sdir="$1" round="$2" reply="$3" raw="$4"
+  print -u2 "✗ Reviewer output did not end with an exact verdict sentinel."
+  print -u2 "  Required final non-blank line: VERDICT: PASS or VERDICT: CHANGES-REQUESTED"
+  [[ -s "$reply" ]] && { print -u2 "── ${reply:t} (last 20 lines)"; tail -20 "$reply" >&2; }
+  [[ -s "$raw" ]] && { print -u2 "── ${raw:t} (last 20 lines)"; tail -20 "$raw" >&2; }
+  round_end "$sdir" failed
+  exit 1
+}
+
+# ── Main flow ─────────────────────────────────────────────────────
+CMD="${1:-}"; [[ -n "$CMD" ]] || usage
+shift || true
+
+# Continuation commands never guess through a shared `.xreview/current` pointer. Pull an
+# explicit --session out of the remaining arguments, wherever it appears.
+SESSION_CLI=""
+if [[ "$CMD" != start && "$CMD" != check ]]; then
+  REST=()
+  while (( $# )); do
+    if [[ "$1" == --session ]]; then
+      [[ -n "${2:-}" ]] || die "--session needs a directory"
+      SESSION_CLI="$2"; shift 2
+    else
+      REST+=("$1"); shift
+    fi
+  done
+  set -- "${REST[@]}"
+fi
+
+case "$CMD" in
+
+start)
+  require_tools perl python3 awk grep sed diff cmp tail cp
+  LABEL=""; IMGS=(); MODEL_CLI=""; MODEL_SPEC=""
+  while [[ "${1:-}" == -* && "${1:-}" != "-" ]]; do
+    case "$1" in
+      --label)
+        LABEL="${2:-}"
+        print -r -- "$LABEL" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
+          || die "--label must use only letters, digits, dot, underscore, and hyphen"
+        shift 2 ;;
+      --reviewer|-r)
+        # Compact spec: ENGINE or ENGINE:MODEL (e.g. grok:grok-4.6, claude:opus).
+        REVIEWER="${2%%:*}"
+        [[ "${2:-}" == *:* ]] && MODEL_SPEC="${2#*:}"
+        [[ " ${ENGINES[*]} " == *" $REVIEWER "* ]] \
+          || die "--reviewer must be ENGINE[:MODEL] with ENGINE one of: ${ENGINES[*]} (got: ${2:-})"
+        shift 2 ;;
+      -m|--model) MODEL_CLI="${2:-}"; shift 2 ;;
+      -i|--image)
+        [[ -f "${2:-}" ]] || die "Image file not found: ${2:-}"
+        IMGS+=("${2:A}"); shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  assert_reviewer_usable "$REVIEWER"
+  # -m wins; then the :MODEL half of --reviewer; then the engine's model env var.
+  case "$REVIEWER" in
+    claude) MODEL="${MODEL_CLI:-${MODEL_SPEC:-${XREVIEW_CLAUDE_MODEL:-}}}" ;;
+    grok)   MODEL="${MODEL_CLI:-${MODEL_SPEC:-${XREVIEW_GROK_MODEL:-}}}" ;;
+    *)      MODEL="${MODEL_CLI:-${MODEL_SPEC:-${XREVIEW_CODEX_MODEL:-}}}" ;;
+  esac
+  TARGET="${1:-}"; [[ -n "$TARGET" ]] || usage
+
+  SDIR="$(make_session_dir "$LABEL")"
+
+  if [[ "$TARGET" == "-" ]]; then
+    cat > "$SDIR/target.md"
+    TARGET_ABS="$SDIR/target.md"
+  else
+    [[ -f "$TARGET" ]] || die "File not found: $TARGET"
+    TARGET_ABS="${TARGET:A}"
+  fi
+  cp "$TARGET_ABS" "$SDIR/snapshot-r1"
+  meta_set "$SDIR" target "$TARGET_ABS"
+  meta_set "$SDIR" cwd "$PWD"
+  meta_set "$SDIR" rounds 1
+
+  {
+    print -r -- "$CHARTER_R1"
+    print -r -- ""
+    print -r -- "────────── Plan under review ──────────"
+    print -r -- "File path (you may read it directly, along with any source code / data files it references): $TARGET_ABS"
+    print -r -- ""
+    print -r -- '```'
+    cat "$TARGET_ABS"
+    print -r -- '```'
+    (( ${#IMGS} )) && {
+      print -r -- ""; img_note "${IMGS[@]}"
+      [[ "$REVIEWER" != codex ]] && path_img_block "${IMGS[@]}"
+    }
+  } > "$SDIR/prompt-r1.md"
+
+  EFFMODEL="$(eff_model "$MODEL")"
+  meta_set "$SDIR" model "$EFFMODEL"
+  # Pin the engine to the session, not to the environment: switching families mid-review
+  # breaks the thread, and the whole point is that the reviewer remembers earlier rounds.
+  meta_set "$SDIR" reviewer "$REVIEWER"
+  IMGNOTE=""; (( ${#IMGS} )) && IMGNOTE=", ${#IMGS} image(s) attached"
+  print -u2 "▶ Round 1, sending for review ($REVIEWER / ${EFFMODEL}${IMGNOTE}, timeout ${TO}s)…"
+  print -u2 "  A round takes 3–15 min and prints nothing until it returns. Let this command finish —"
+  print -u2 "  if your harness yields early, poll the same command; use:"
+  print -u2 "  xreview status --session $SDIR"
+  (( ${#IMGS} )) && meta_set "$SDIR" images "${(j:,:)IMGS}"
+  round_begin "$SDIR" 1
+  PROMPT_FILE="$SDIR/prompt-r1.md"
+  engine_start_$REVIEWER "$EFFMODEL" "$MODEL" "${IMGS[@]}"
+  run_reviewer "$SDIR" 1 "$REVIEWER"
+
+  if ! THREAD="$(parse_reply "$SDIR/raw-r1.jsonl" "$SDIR/reply-r1.md")"; then
+    backend_failed "$SDIR" 1 "Could not parse reviewer output"
+  fi
+  [[ -n "$THREAD" ]] || backend_failed "$SDIR" 1 "Could not capture reviewer thread id"
+  meta_set "$SDIR" thread "$THREAD"
+  V="$(verdict_of "$SDIR/reply-r1.md")"
+  [[ "$V" != UNKNOWN ]] || reject_unknown_verdict "$SDIR" 1 "$SDIR/reply-r1.md" "$SDIR/raw-r1.jsonl"
+  meta_set "$SDIR" verdict "$V"
+  round_end "$SDIR" done
+
+  cat "$SDIR/reply-r1.md"
+  print -u2 ""
+  print -u2 "── Round 1 verdict: $V / session=$SDIR / thread=$THREAD"
+  [[ "$V" == PASS ]] \
+    && print -u2 "→ Go straight to: xreview stamp --session $SDIR" \
+    || print -u2 "→ Once fixed, or to push back: xreview round --session $SDIR -"
+  ;;
+
+round)
+  require_tools perl python3 awk grep sed diff cmp tail cp
+  IMGS=()
+  while [[ "${1:-}" == -i || "${1:-}" == --image ]]; do
+    [[ -f "${2:-}" ]] || die "Image file not found: ${2:-}"
+    IMGS+=("${2:A}"); shift 2
+  done
+  SDIR="$(cur_session)"
+  THREAD="$(meta_get "$SDIR" thread)"; [[ -n "$THREAD" ]] || die "Session has no thread: $SDIR"
+  TARGET="$(meta_get "$SDIR" target)"
+  [[ -f "$TARGET" ]] || die "Target not found: $TARGET"
+  N=$(( $(meta_get "$SDIR" rounds) + 1 ))
+  # The engine follows the session, not the environment — see the note at `start`.
+  RVW="$(meta_get "$SDIR" reviewer)"; [[ -n "$RVW" ]] || RVW=codex
+  REVIEWER="$RVW"
+  assert_reviewer_usable "$RVW"
+
+  BODY=""
+  if [[ "${1:-}" == "-" || -z "${1:-}" ]]; then
+    BODY="$(cat)"
+  else
+    BODY="$*"
+  fi
+  [[ -n "$BODY" ]] || die "The author reply is empty."
+
+  PREV=$(( N - 1 ))
+  {
+    print -r -- "$CHARTER_RN"
+    print -r -- ""
+    print -r -- "────────── Author reply to round $PREV ──────────"
+    print -r -- "$BODY"
+    print -r -- ""
+    print -r -- "────────── Changes to the plan file ──────────"
+    print -r -- "File: $TARGET (you may re-read it to confirm)"
+    if ! diff -u "$SDIR/snapshot-r$PREV" "$TARGET" > "$SDIR/diff-r$N.txt" 2>/dev/null; then
+      if [[ "$(wc -l < "$SDIR/diff-r$N.txt" | tr -d ' ')" -gt 500 ]]; then
+        print -r -- "(the diff is over 500 lines, please just re-read the file)"
+      else
+        print -r -- '```diff'
+        cat "$SDIR/diff-r$N.txt"
+        print -r -- '```'
+      fi
+    else
+      print -r -- "(the plan file itself did not change — the author responded by argument, not by editing)"
+    fi
+    cp "$TARGET" "$SDIR/snapshot-r$N"
+    if (( ${#IMGS} )); then
+      print -r -- ""
+      img_note "${IMGS[@]}"
+      [[ "$RVW" != codex ]] && path_img_block "${IMGS[@]}"
+      print -r -- "(these were re-captured after the changes; use them to verify the earlier visual problems.)"
+    fi
+  } > "$SDIR/prompt-r$N.md"
+
+  IMGNOTE=""; (( ${#IMGS} )) && IMGNOTE=", ${#IMGS} new image(s) attached"
+  print -u2 "▶ Round $N, sending for review ($RVW resume thread=$THREAD${IMGNOTE})…"
+  print -u2 "  A round takes 3–15 min and prints nothing until it returns. Let this command finish."
+  round_begin "$SDIR" "$N"
+  PROMPT_FILE="$SDIR/prompt-r$N.md"
+  engine_resume_$RVW "$(eff_model "$(meta_get "$SDIR" model)")" "$THREAD" \
+    "$(meta_get "$SDIR" cwd)" "${IMGS[@]}"
+  run_reviewer "$SDIR" "$N" "$RVW resume"
+
+  if ! parse_reply "$SDIR/raw-r$N.jsonl" "$SDIR/reply-r$N.md" > /dev/null; then
+    backend_failed "$SDIR" "$N" "Could not parse reviewer output"
+  fi
+  meta_set "$SDIR" rounds "$N"
+  V="$(verdict_of "$SDIR/reply-r$N.md")"
+  [[ "$V" != UNKNOWN ]] || reject_unknown_verdict "$SDIR" "$N" "$SDIR/reply-r$N.md" "$SDIR/raw-r$N.jsonl"
+  meta_set "$SDIR" verdict "$V"
+  round_end "$SDIR" done
+
+  cat "$SDIR/reply-r$N.md"
+  print -u2 ""
+  print -u2 "── Round $N verdict: $V"
+  [[ "$V" == PASS ]] \
+    && print -u2 "→ Consensus reached: xreview stamp --session $SDIR" \
+    || print -u2 "→ Continue: xreview round --session $SDIR -"
+  ;;
+
+status)
+  (( $# == 0 )) || die "status accepts only --session <run-directory>"
+  SDIR="$(cur_session)"
+  print -r -- "session : $SDIR"
+  print -r -- "target  : $(meta_get "$SDIR" target)"
+  print -r -- "reviewer: $(meta_get "$SDIR" reviewer) / $(eff_model "$(meta_get "$SDIR" model)")"
+  print -r -- "thread  : $(meta_get "$SDIR" thread)"
+  print -r -- "rounds  : $(meta_get "$SDIR" rounds)"
+  print -r -- "verdict : $(meta_get "$SDIR" verdict)"
+  print -r -- "state   : $(state_line "$SDIR")"
+  ;;
+
+log)
+  (( $# == 0 )) || die "log accepts only --session <run-directory>"
+  SDIR="$(cur_session)"
+  for f in "$SDIR"/reply-r*.md(nN); do
+    print -r -- "════════ ${f:t} ════════"
+    cat "$f"
+    print -r -- ""
+  done
+  ;;
+
+stamp)
+  require_tools python3 cmp
+  (( $# == 0 )) || die "stamp accepts only --session <run-directory>; there is no force override"
+  SDIR="$(cur_session)"
+  V="$(meta_get "$SDIR" verdict)"
+  TARGET="$(meta_get "$SDIR" target)"
+  [[ -f "$TARGET" ]] || die "Target not found: $TARGET"
+  [[ "$V" == PASS ]] || die "The latest verdict is $V, not PASS. No stamping without consensus."
+  N="$(meta_get "$SDIR" rounds)"
+  SNAPSHOT="$SDIR/snapshot-r$N"
+  [[ -f "$SNAPSHOT" ]] || die "Reviewed snapshot not found: $SNAPSHOT"
+  cmp -s "$TARGET" "$SNAPSHOT" \
+    || die "Target changed after the PASS review. Run another round before stamping."
+  case "${TARGET:e}" in
+    md|markdown|html|htm)      OPEN="<!-- "; CLOSE=" -->" ;;
+    js|ts|jsx|tsx|c|h|cpp|java) OPEN="// ";   CLOSE="" ;;
+    f|f90|F90|for)             OPEN="! ";    CLOSE="" ;;
+    *)                         OPEN="# ";    CLOSE="" ;;
+  esac
+  DIGEST="$(sha256_file "$SNAPSHOT")"
+  SEP="$(needs_separator "$TARGET")"
+  M="$(marker_line "$SDIR" "$DIGEST" "$SEP")"
+  (( SEP == 1 )) && print -r -- "" >> "$TARGET"
+  print -r -- "${OPEN}${M}${CLOSE}" >> "$TARGET"
+  print -u2 "✅ Stamped into $TARGET:"
+  print -u2 "   ${OPEN}${M}${CLOSE}"
+  ;;
+
+check)
+  require_tools python3
+  # PASS is valid only when the final marker's digest reconstructs the exact reviewed
+  # pre-stamp bytes. SKIP is a final-line human exemption, not a review result.
+  F="${1:-}"; [[ -f "$F" ]] || die "File not found: $F"
+  (( $# == 1 )) || die "Usage: xreview check <file>"
+  marker_valid "$F"
+  ;;
+
+*) usage ;;
+esac

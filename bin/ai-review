@@ -1,0 +1,267 @@
+#!/usr/bin/env zsh
+# ai-review — anti-flattery article review
+#   Core design: anonymise the author (removes the flattery trigger) + multi-lens
+#                reviewers (praise banned, itemised format) + a rebuttal round
+#                (filters out filler criticism invented to look useful) + an
+#                editor who synthesises the revised version.
+#   The structured rubric is what holds mid-tier models (opus / gpt-5.5) to this
+#   behaviour; it does not rely on a top-tier model having the judgement itself.
+# Usage: ai-review draft.md          # full: 4 lenses in parallel + double rebuttal filter + revised version
+#        ai-review -q draft.md       # quick: one reviewer, one round, about 1 minute
+#        ai-review - < draft.md      # read from stdin
+set -euo pipefail
+
+usage() {
+  print -u2 "Usage: ai-review draft.md          # full: 4 lenses + rebuttal filter + revised version (needs claude + codex)"
+  print -u2 "       ai-review -q draft.md       # quick: single reviewer (claude only), skips the rebuttal round"
+  print -u2 "       ai-review - < draft.md      # read from stdin"
+  print -u2 "Models: AI_REVIEW_CLAUDE_MODEL (default opus), AI_REVIEW_CODEX_MODEL (default: codex's own default)"
+  print -u2 "Env:    AI_REVIEW_LANG / AI_LANG (reply language, default en), AI_REVIEW_VAULT, AI_REVIEW_CONTEXT_FILE"
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then usage; exit 0; fi
+QUICK=0
+if [[ "${1:-}" == "-q" || "${1:-}" == "--quick" ]]; then QUICK=1; shift; fi
+
+# ── Output language ──────────────────────────────────────────────
+# The reviewer/judge models answer in this language. English by default.
+# Set AI_LANG (or the per-tool override) to switch, e.g. AI_LANG=zh-TW
+case "${AI_REVIEW_LANG:-${AI_LANG:-en}}" in
+  ""|en|en-*|english)          LANG_RULE="Answer in English." ;;
+  zh-TW|zh_TW|zh-Hant|zh)      LANG_RULE="一律以繁體中文（台灣用語）回答。" ;;
+  *)                           LANG_RULE="Answer in ${AI_REVIEW_LANG:-${AI_LANG}}." ;;
+esac
+
+FILE="${1:-}"
+if [[ -z "$FILE" ]]; then usage; exit 1; fi
+if [[ "$FILE" == "-" ]]; then
+  TEXT="$(cat)"
+  NAME="stdin"
+else
+  [[ -f "$FILE" ]] || { print -u2 "File not found: $FILE"; exit 1; }
+  TEXT="$(cat "$FILE")"
+  NAME="${FILE:t:r}"
+fi
+[[ -z "$TEXT" ]] && { print -u2 "File is empty."; exit 1; }
+
+command -v perl > /dev/null 2>&1 || { print -u2 "✗ Required CLI not found: perl"; exit 1; }
+command -v claude > /dev/null 2>&1 || { print -u2 "✗ Required CLI not found: claude"; exit 1; }
+if (( ! QUICK )); then
+  command -v codex > /dev/null 2>&1 || { print -u2 "✗ Required CLI not found: codex"; exit 1; }
+fi
+
+mkdir -p .ai-review
+OUT=".ai-review/$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
+mkdir "$OUT" || { print -u2 "✗ Could not create unique run directory: $OUT"; exit 1; }
+print -r -- "$TEXT" > "$OUT/draft.md"
+
+# Models are pinned here so a run cannot inherit whatever the claude CLI session
+# happens to default to (Fable, for instance).
+CLAUDE_FLAGS=(-p --no-session-persistence --model "${AI_REVIEW_CLAUDE_MODEL:-opus}")
+CODEX_FLAGS=(exec --ephemeral --skip-git-repo-check -s read-only)
+[[ -n "${AI_REVIEW_CODEX_MODEL:-}" ]] && CODEX_FLAGS+=(-m "$AI_REVIEW_CODEX_MODEL")
+
+# ── Wall-clock cap on every model call ────────────────────────────────────────
+# Without one, a single hung CLI call blocks the entire run indefinitely: no
+# output, no error, nothing on stderr. Observed in practice — two codex lenses
+# hung for seven hours while the run sat waiting on them. xreview and ai-duel
+# already cap their calls; this tool did not.
+TO="${AI_REVIEW_TIMEOUT:-600}"
+capped() { perl -e 'alarm shift; exec @ARGV' "$TO" "$@"; }
+
+# ── Anti-flattery core: anonymous-submission framing + praise banned + itemised
+#    format + anti-fabrication warning + a forced verdict ──────────────────────
+PREAMBLE='You are a reviewer known for being severe. The article below is an ANONYMOUS THIRD-PARTY SUBMISSION — the author is not present, you owe the author nothing, and your comments are seen only by the editor, never by the author. Your job is to find problems, not to hand out approval.
+
+Hard rules:
+1. No praise of any kind. No pleasantries, nothing along the lines of "overall this is well written". Do not point out strengths; the editor can see those unaided.
+2. Every finding must contain four parts:
+   [LOCATION] quote the fragment of the original text directly (≤30 words)
+   [PROBLEM] say specifically what is wrong and why it is wrong
+   [SEVERITY] high / medium / low
+   [FIX] a remedy that can be applied exactly as written (a rewritten example is better)
+3. Do not fabricate or inflate problems to pad the count: every finding you write will afterwards be checked point by point against the original text by another reviewer, and fabrication gets flagged. If some aspect really is fine, skip it — do not force a complaint out of it.
+4. Review only the aspect you were assigned. Other reviewers cover the other aspects.
+5. Last line, the verdict: "VERDICT: ACCEPT / MINOR REVISION / MAJOR REVISION / REJECT — one sentence on the main reason".
+When you quote the original text, keep the quote in the language it was written in.'
+
+L_LOGIC='You cover [ARGUMENT AND STRUCTURE]: whether claims are supported by evidence, whether the reasoning skips steps, whether the order of the sections actually supports the conclusion, whether the text contradicts itself, whether key concepts are used before they are defined.'
+L_FACT='You cover [CONTENT AND FACTS]: factual errors and out-of-date statements, assertions that need a citation or data to back them and have none, whether numbers and units are correct, generalising from too little evidence or stretching a result too far. If the article concerns a project, tool or dataset belonging to the author, first locate the current-status document for that project and use it to check whether the facts in the article are stale.'
+L_STYLE='You cover [WORDING AND EXPRESSION]: padding, vagueness, terminology that changes from one section to the next, sentences that carry no information, over-long paragraphs, headings that do not match the text under them.'
+L_READER='You cover [THE READER VIEW]: assume you are the target reader of this article — where do you stop following it, where do you lose patience, which key question is never answered, are you convinced once you have finished? If you are not convinced, what is missing?'
+
+# Optional: point the fact-checking lens at the index of the author's own projects.
+# Only fires when AI_REVIEW_CONTEXT_FILE is set AND the file is really there; if it
+# is unset or missing, nothing is appended and nothing is said about it, so a
+# recipient without such an index just gets the plain fact-checking remit.
+CTX_FILE="${AI_REVIEW_CONTEXT_FILE:-}"
+if [[ -n "$CTX_FILE" && -f "$CTX_FILE" ]]; then
+  L_FACT="$L_FACT Read $CTX_FILE: it indexes the author's own projects and points at each one's current-status document. Use it when checking whether claims the article makes about those projects are out of date."
+fi
+
+mk_prompt() {
+  print -r -- "$PREAMBLE
+$LANG_RULE
+
+$1
+
+[ANONYMOUS SUBMISSION — FULL TEXT]
+$TEXT"
+}
+
+# ── Quick mode: one reviewer, one round (all aspects), skipping both the
+#    rebuttal round and the revised version ────────────────────────────────
+if (( QUICK )); then
+  echo "⚡ Quick review (single reviewer: ${AI_REVIEW_CLAUDE_MODEL:-opus})…"
+  capped claude "${CLAUDE_FLAGS[@]}" "$(mk_prompt 'You cover every aspect single-handed: argument and structure, content and facts, wording and expression, the reader view.')" \
+    | tee "$OUT/review.md" | sed 's/^/|REVIEW| /'
+  cp "$OUT/review.md" "$OUT/final.md"
+else
+
+# ── Round 1: four reviewers in parallel, one aspect each, alternating between
+#    the two model families ──────────────────────────────────────────────────
+echo "▶ Round 1: four reviewers in parallel (anonymous submission, praise banned)…"
+capped claude "${CLAUDE_FLAGS[@]}" "$(mk_prompt "$L_LOGIC")"  > "$OUT/critic-logic.md"  &
+capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/critic-fact.md"   "$(mk_prompt "$L_FACT")"   > /dev/null &
+capped claude "${CLAUDE_FLAGS[@]}" "$(mk_prompt "$L_STYLE")"  > "$OUT/critic-style.md"  &
+capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/critic-reader.md" "$(mk_prompt "$L_READER")" > /dev/null &
+wait
+
+# Decide which lenses actually delivered a review.
+#
+# Emptiness is not a sufficient test. `codex exec` exits 0 and writes its own
+# error text into the -o file when it is out of quota, so a failed lens leaves a
+# NON-empty file containing "ERROR: You've hit your usage limit" and nothing
+# else. Feeding that into the editor as if it were a finding is worse than
+# losing the lens.
+#
+# The charter requires every reviewer to end with a verdict line, so presence of
+# that sentinel is the real test of "this is a review, not wreckage". It also
+# catches timeouts, empty files and CLI crashes in the same check.
+lens_ok() { [[ -s "$1" ]] && grep -qE '^[[:space:]]*(裁決|VERDICT)' "$1" 2>/dev/null }
+
+DROPPED=()
+for f in logic fact style reader; do
+  lens_ok "$OUT/critic-$f.md" || DROPPED+=("$f")
+done
+if (( ${#DROPPED} )); then
+  print -u2 "⚠ ${#DROPPED} of 4 reviewers produced no usable review (timed out after ${TO}s, out of quota, or the CLI failed): ${DROPPED[*]}"
+  print -u2 "  Continuing with the remaining $(( 4 - ${#DROPPED} )). The report below is thinner than a full run — check $OUT/critic-<lens>.md for the reason."
+  (( ${#DROPPED} == 4 )) && { print -u2 "✗ No reviewer produced a review. Stopping."; exit 1; }
+fi
+
+ALL_CRIT="$(
+  for f in logic fact style reader; do
+    lens_ok "$OUT/critic-$f.md" || continue
+    print -r -- "## Reviewer [$f]"
+    cat "$OUT/critic-$f.md"
+    print -r -- ""
+  done
+)"
+print -r -- "$ALL_CRIT" > "$OUT/criticisms.md"
+# Greps the reviewers' own output, so it must match whichever form they emitted:
+# the charter asks for the ASCII "VERDICT", but a Chinese-language run answers
+# with 裁決. Matching only one of the two makes this summary go silently blank.
+grep -hE '^(裁決|VERDICT)' "$OUT"/critic-*.md 2>/dev/null | sed 's/^/|VERDICT| /' || true
+
+# ── Round 2: the double rebuttal round — every finding is checked point by
+#    point, filtering out the fabricated and the overstated ─────────────────
+echo "▶ Round 2: two checkers calibrate the findings point by point (filtering fabricated/overstated ones)…"
+REFUTE_PROMPT="Reviewers sometimes overstate or fabricate problems in order to look rigorous (especially when they have been told they MUST find something wrong).
+Below are an anonymous article and the findings of several reviewers. Check each finding against the original text, point by point, and decide whether it really holds.
+Output a table: | # | finding in brief (≤20 words) | result (upheld/overstated/rejected) | reason |
+Calibration rules:
+- upheld     = the original text really does have this problem, and the suggested fix is workable.
+- overstated = there is something to it, but the severity is inflated, or the suggested fix goes too far.
+- rejected   = the original text does not have this problem, or the finding misread the original text.
+You are on neither the reviewers' side nor the author's side. The original text is your only evidence.
+$LANG_RULE
+
+[ORIGINAL TEXT]
+$TEXT
+
+[REVIEWER FINDINGS]
+$ALL_CRIT"
+
+capped claude "${CLAUDE_FLAGS[@]}" "$REFUTE_PROMPT" > "$OUT/verify-a.md" &
+capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/verify-b.md" "$REFUTE_PROMPT" > /dev/null &
+wait
+
+# Same failure mode as the lenses: a checker that timed out or ran out of quota
+# leaves a file that is non-empty but contains only an error. Handing that to the
+# editor as a "calibration" would let CLI wreckage decide which findings survive.
+# A real calibration marks findings upheld / overstated / rejected, so require it.
+checker_ok() { [[ -s "$1" ]] && grep -qiE 'upheld|overstated|rejected|成立|誇大|不成立' "$1" 2>/dev/null }
+CAL_A="$(checker_ok "$OUT/verify-a.md" && cat "$OUT/verify-a.md" || print -r -- '(checker A produced no usable calibration — treat every finding as unverified)')"
+CAL_B="$(checker_ok "$OUT/verify-b.md" && cat "$OUT/verify-b.md" || print -r -- '(checker B produced no usable calibration — treat every finding as unverified)')"
+checker_ok "$OUT/verify-a.md" || print -u2 "⚠ Checker A produced no usable calibration (timeout, quota, or CLI failure)."
+checker_ok "$OUT/verify-b.md" || print -u2 "⚠ Checker B produced no usable calibration (timeout, quota, or CLI failure)."
+
+# ── Round 3: the editor synthesises — only findings that survived checking are
+#    kept, and a revised version is produced ────────────────────────────────
+echo "▶ Round 3: editor synthesis + revised version…"
+capped claude "${CLAUDE_FLAGS[@]}" "You are the editor. You have: the original anonymous article, findings from four reviewers, and point-by-point calibrations from two independent checkers. Produce two parts:
+
+# Part 1: final review report
+- Delete outright any finding both checkers marked 'rejected'; do not mention it.
+- Keep any finding at least one checker marked 'upheld'; where the two calibrations conflict, or where a finding was marked 'overstated', keep it but drop its severity by one level and tag it ⚖️.
+- Sort by severity (high → medium → low), keeping [LOCATION] [PROBLEM] [FIX] for each finding.
+- First line: the overall verdict (ACCEPT / MINOR REVISION / MAJOR REVISION / REJECT). Praise and pleasantries are banned here too.
+
+# Part 2: revised full text
+- Rewrite the whole article according to the findings that survived checking. Keep the language of the original and the voice of the author, and change nothing outside the scope of those findings.
+- Wherever the author has to supply data or make the decision, mark the spot in the text as [TODO: …] instead of inventing content on the author's behalf.
+$LANG_RULE
+
+[ORIGINAL TEXT]
+$TEXT
+
+[REVIEWER FINDINGS]
+$ALL_CRIT
+
+[CHECKER A CALIBRATION]
+$CAL_A
+
+[CHECKER B CALIBRATION]
+$CAL_B" > "$OUT/final.md" 2>/dev/null || true
+
+# The editor is one more model call and fails the same way the others do: out of
+# quota, it writes its provider's error message and nothing else. Left unchecked
+# that error becomes final.md — the one file a reader actually opens — and the
+# whole run looks like it produced a one-line report. Everything upstream is
+# still on disk and still useful, so say that instead of dying silently.
+if [[ ! -s "$OUT/final.md" ]] || ! grep -qiE 'ACCEPT|MINOR REVISION|MAJOR REVISION|REJECT|裁決|verdict' "$OUT/final.md"; then
+  print -u2 "✗ The editor produced no usable report (timed out after ${TO}s, out of quota, or the CLI failed)."
+  print -u2 "  What it returned: $(head -c 200 "$OUT/final.md" 2>/dev/null)"
+  print -u2 "  Round 1 and 2 survived — the reviewer findings are in $OUT/criticisms.md"
+  print -u2 "  and the calibrations in $OUT/verify-a.md / verify-b.md. Re-run just the"
+  print -u2 "  synthesis later rather than repeating the whole review."
+  exit 1
+fi
+sed 's/^/|EDITOR| /' "$OUT/final.md"
+
+fi  # QUICK
+
+# ── Export an Obsidian note ──────────────────────────────────────────
+VAULT="${AI_REVIEW_VAULT:-$HOME/notes}"
+TS="$(date +%Y%m%d-%H%M%S)"
+if [[ -d "$VAULT" ]]; then
+  NOTE_DIR="$VAULT/ai-review"
+  NOTE="$NOTE_DIR/${TS} ${NAME}.md"
+  mkdir -p "$NOTE_DIR"
+  {
+    print -r -- "---"
+    print -r -- "tags: [ai-review$( (( QUICK )) && print -rn -- ', quick' )]"
+    print -r -- "date: $(date +%Y-%m-%d)"
+    print -r -- "source: ${FILE}"
+    print -r -- "---"
+    print -r -- ""
+    cat "$OUT/final.md"
+  } > "$NOTE"
+  echo
+  echo "✅ Done. Filed in Obsidian: ${NOTE#$HOME/}"
+  echo "   Working files (each reviewer's raw findings, the calibration tables) kept in ${OUT}/"
+else
+  echo
+  echo "⚠️ No vault at $VAULT — output written to $OUT/ only"
+fi

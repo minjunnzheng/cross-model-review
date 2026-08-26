@@ -1,0 +1,546 @@
+#!/usr/bin/env zsh
+# ai-duel — send the same question to Claude and to Codex, run one peer-critique round,
+# then a double-blind claim-level verdict.
+# Only Claude and Codex take part by default. Set AI_DUEL_NEUTRAL to add a third-party
+# neutral judge that blind-reviews alongside them.
+# Usage: ai-duel "Review this design proposal: ..."
+#   For a coding task, isolate the two models in two git worktrees instead — do not point
+#   this tool at two models editing the same file.
+set -euo pipefail
+
+# -c / --continue: take the combined conclusion of the previous duel as background, then
+#                  ask the follow-up question on top of it.
+# -q / --quick   : quick follow-up mode — same background, but ask a single AI and take its
+#                  answer directly, skipping peer critique (Round 2) and the blind verdict
+#                  (Round 3). Usage: -q claude / -q codex
+usage() {
+  print -u2 "Usage: ai-duel \"your question\"            # new duel (full critique + verdict; needs claude + codex)"
+  print -u2 "       ai-duel -c \"follow-up…\"            # continue from the last conclusion (state: .ai-duel/ in the cwd), full run"
+  print -u2 "       ai-duel -q claude \"follow-up…\"     # quick follow-up: ask Claude only, answer directly"
+  print -u2 "       ai-duel -q codex  \"follow-up…\"     # quick follow-up: ask Codex only (only the named CLI is needed)"
+  print -u2 "Models: AI_DUEL_CLAUDE_MODEL (default opus), AI_DUEL_CODEX_MODEL (default: codex's own), AI_DUEL_GROK_MODEL / AI_DUEL_AGY_MODEL"
+  print -u2 "Env:    AI_DUEL_LANG / AI_LANG (reply language, default en), AI_DUEL_TIMEOUT (default 900s),"
+  print -u2 "        AI_DUEL_NEUTRAL (opt-in third-party judge: auto|grok|agy|grok,agy — off by default),"
+  print -u2 "        AI_DUEL_VAULT (transcript directory, default ~/notes), AI_DUEL_CONTEXT_FILE (project index)"
+}
+
+CONTINUE=0
+QUICK=0
+QMODEL="claude"   # default model for quick mode; override with -q codex
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  -c|--continue) CONTINUE=1; shift ;;
+  -q|--quick)
+    QUICK=1; CONTINUE=1; shift   # quick mode is a continue mode as well
+    case "${1:-}" in
+      claude|codex) QMODEL="$1"; shift ;;   # only consume this argument if it names a model
+    esac
+    ;;
+esac
+
+# ── Output language ──────────────────────────────────────────────
+# The contestant/judge models answer in this language. English by default.
+# Set AI_LANG (or the per-tool override AI_DUEL_LANG) to switch, e.g. AI_LANG=zh-TW
+case "${AI_DUEL_LANG:-${AI_LANG:-en}}" in
+  ""|en|en-*|english)          LANG_RULE="Answer in English." ;;
+  zh-TW|zh_TW|zh-Hant|zh)      LANG_RULE="一律以繁體中文（台灣用語）回答。" ;;
+  *)                           LANG_RULE="Answer in ${AI_DUEL_LANG:-${AI_LANG}}." ;;
+esac
+
+PROMPT="$*"
+[[ -z "$PROMPT" ]] && { usage; exit 1; }
+
+require_cli() {
+  command -v "$1" > /dev/null 2>&1 || { print -u2 "✗ Required CLI not found: $1"; exit 1; }
+}
+require_cli perl
+if (( QUICK )); then
+  require_cli "$QMODEL"
+else
+  require_cli claude
+  require_cli codex
+fi
+
+# Continue mode: use the final.md of the most recent duel as the recap
+CONTEXT=""
+if (( CONTINUE )); then
+  # (N) = null glob, so a missing .ai-duel/ is not a fatal error under `set -e`
+  # (the 2>/dev/null only silences ls; the glob itself fails in the shell first).
+  # (om) = order by modification time, newest first.
+  _prev=(.ai-duel/*/(Nom))
+  LAST="${_prev[1]:-}"
+  if [[ -n "$LAST" && -f "${LAST}final.md" ]]; then
+    CONTEXT="[Conclusion of the earlier discussion, as background]
+$(cat "${LAST}final.md")
+
+────────── end of background; the new follow-up question follows ──────────
+"
+    echo "↻ Continuing from: ${LAST}"
+  else
+    echo "⚠️ No previous duel found; treating this as a brand-new question."
+  fi
+fi
+# From here on, everything that used \$PROMPT uses \$FULL instead (question plus background)
+FULL="${CONTEXT}${PROMPT}"
+
+mkdir -p .ai-duel
+OUT=".ai-duel/$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
+mkdir "$OUT" || { print -u2 "✗ Could not create unique run directory: $OUT"; exit 1; }
+print -r -- "$PROMPT" > "$OUT/prompt.txt"
+
+# Shared flags
+# The model is pinned to opus so the run cannot inherit the claude CLI session default
+# (Fable, for example); override with the environment variables
+# AI_DUEL_CLAUDE_MODEL / AI_DUEL_CODEX_MODEL.
+CLAUDE_FLAGS=(-p --no-session-persistence --model "${AI_DUEL_CLAUDE_MODEL:-opus}")
+# The home directory is usually not a git repo → codex must get --skip-git-repo-check;
+# read-only so it never touches files.
+CODEX_FLAGS=(exec --ephemeral --skip-git-repo-check -s read-only)
+[[ -n "${AI_DUEL_CODEX_MODEL:-}" ]] && CODEX_FLAGS+=(-m "$AI_DUEL_CODEX_MODEL")
+
+# ── Wall-clock cap on every model call ────────────────────────────────────────
+# The neutral judges below already had one; the contestants and the two primary
+# judges did not, so a single hung CLI call could block the whole duel forever
+# with no output and nothing on stderr. Sibling tool ai-review was observed
+# sitting on exactly that for seven hours.
+TO="${AI_DUEL_TIMEOUT:-900}"
+
+# A model call that failed still leaves a file: an empty one on timeout, or one holding
+# only the provider's error text when the CLI is out of quota. Word count is the cheapest
+# test that separates "an answer arrived" from "wreckage arrived".
+answered() { [[ -s "$1" ]] && [[ "$(wc -w < "$1" | tr -d ' ')" -ge 20 ]] }
+# stdin is redirected from /dev/null: `claude -p` waits 3 s for stdin even when the
+# prompt is passed as an argument, then warns on stderr. Three seconds per call adds
+# up across eight of them, and the warning is pure noise in the log.
+capped() { perl -e 'alarm shift; exec @ARGV' "$TO" "$@" < /dev/null; }
+
+# ── Neutral judge (not a contestant): off by default, only runs if you ask for it ──
+# By default the duel is Claude against Codex, nothing else. To add a third-party neutral
+# judge, set AI_DUEL_NEUTRAL:
+#   AI_DUEL_NEUTRAL=auto       try both, use whichever is detected
+#   AI_DUEL_NEUTRAL=grok       Grok only
+#   AI_DUEL_NEUTRAL=agy        Antigravity only
+#   AI_DUEL_NEUTRAL=grok,agy   both
+# Unset, or set to off/0/no/false = not enabled at all, not even detected.
+#
+# Why this is not "use it automatically if it is on PATH": that would send the full text of
+# the question to a third-party provider during a duel without the user noticing. Who your
+# content is sent to has to be a decision that was stated out loud; it must not happen
+# silently just because some CLI happens to be installed on the machine.
+#
+# Grok: prefers the official grok CLI (uses the subscription login, zero marginal cost); with
+#       no CLI but XAI_API_KEY + jq present it goes through the API instead.
+#       Antigravity: needs the agy CLI on PATH.
+GROK_ON=0; GROK_VIA=""; AGY_ON=0
+case "${AI_DUEL_NEUTRAL:-}" in
+  ""|off|0|no|false) NEUTRAL="" ;;
+  *)                 NEUTRAL="${AI_DUEL_NEUTRAL}" ;;
+esac
+if [[ -n "$NEUTRAL" ]]; then
+  WANT_GROK=0; WANT_AGY=0
+  case "$NEUTRAL" in
+    auto|all) WANT_GROK=1; WANT_AGY=1 ;;
+    *) [[ "$NEUTRAL" == *grok* ]] && WANT_GROK=1
+       [[ "$NEUTRAL" == *agy* || "$NEUTRAL" == *antigravity* ]] && WANT_AGY=1 ;;
+  esac
+  if (( WANT_GROK )); then
+    GROK_BIN="${AI_DUEL_GROK_BIN:-$(command -v grok 2>/dev/null || true)}"
+    [[ -z "$GROK_BIN" && -x "$HOME/.grok/bin/grok" ]] && GROK_BIN="$HOME/.grok/bin/grok"
+    if [[ -n "$GROK_BIN" ]]; then
+      GROK_ON=1; GROK_VIA="cli"
+    elif [[ -n "${XAI_API_KEY:-}" ]] && command -v jq > /dev/null 2>&1; then
+      GROK_ON=1; GROK_VIA="api"
+    else
+      print -u2 "⚠ AI_DUEL_NEUTRAL asked for grok, but there is no grok CLI and no XAI_API_KEY+jq — skipped this run."
+    fi
+  fi
+  if (( WANT_AGY )); then
+    AGY_BIN="${AI_DUEL_AGY_BIN:-$(command -v agy 2>/dev/null || true)}"
+    [[ -z "$AGY_BIN" && -x "$HOME/.local/bin/agy" ]] && AGY_BIN="$HOME/.local/bin/agy"
+    if [[ -n "$AGY_BIN" ]]; then
+      AGY_ON=1
+    else
+      print -u2 "⚠ AI_DUEL_NEUTRAL asked for agy, but agy is not on PATH — skipped this run."
+    fi
+  fi
+fi
+
+# Grok judge: CLI mode is a single grok -p turn (read-only sandbox + tools blocked + perl
+# alarm for the timeout); API mode goes through the xAI OpenAI-compatible API, with the key
+# passed via a mode-600 curl config file so it never shows up in ps.
+# Any failure prints a warning and returns 0, so set -e / wait cannot kill the whole duel.
+grok_judge() {  # $1 = verdict prompt; stdout = the verdict text
+  if [[ "$GROK_VIA" == "cli" ]]; then
+    # The shell stays available (running a real check inside the read-only sandbox is what
+    # earns the "tested" evidence level); writing files and web access are blocked;
+    # --always-approve stops a headless run from hanging on a permission prompt.
+    local flags=(-p "$1" --max-turns 8 --sandbox read-only --output-format plain
+                 --always-approve --disallowed-tools "write,edit,web_search,web_fetch"
+                 --rules "$LANG_RULE")
+    [[ -n "${AI_DUEL_GROK_MODEL:-}" ]] && flags+=(-m "$AI_DUEL_GROK_MODEL")
+    perl -e 'alarm shift; exec @ARGV' "${AI_DUEL_GROK_TIMEOUT:-300}" \
+      "$GROK_BIN" "${flags[@]}" 2>/dev/null || print -r -- "⚠️ Grok CLI verdict failed (timeout or error)"
+    return 0
+  fi
+  local model="${AI_DUEL_GROK_MODEL:-${GROK_MODEL:-grok-4.6}}"
+  local cfg payload resp content
+  cfg="$(mktemp)" && chmod 600 "$cfg"
+  print -r -- "header = \"Authorization: Bearer $XAI_API_KEY\"" > "$cfg"
+  payload="$(jq -n --arg m "$model" --arg p "$1" \
+    '{model:$m, messages:[{role:"user",content:$p}], temperature:0.2, max_tokens:16384}')"
+  resp="$(curl -sS --max-time "${AI_DUEL_GROK_TIMEOUT:-300}" --config "$cfg" \
+    -H "Content-Type: application/json" \
+    -d "$payload" https://api.x.ai/v1/chat/completions 2>&1)" \
+    || { rm -f "$cfg"; print -r -- "⚠️ Grok verdict failed (network/timeout): $resp"; return 0; }
+  rm -f "$cfg"
+  content="$(print -r -- "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null)"
+  if [[ -n "$content" ]]; then
+    print -r -- "$content"
+  else
+    local err
+    err="$(print -r -- "$resp" | jq -r '.error.message? // .error? // empty' 2>/dev/null | head -5)"
+    [[ -z "$err" ]] && err="$(print -r -- "$resp" | head -5)"   # non-JSON error (a 502 page, say)
+    print -r -- "⚠️ Grok verdict failed: $err"
+  fi
+  return 0
+}
+
+# Antigravity judge: agy is an agentic CLI, not a chat CLI, so it needs a guard that blocks
+# tools + a sandbox; macOS has no GNU timeout, so perl alarm supplies the timeout.
+agy_judge() {  # $1 = verdict prompt; stdout = the verdict text
+  local guard='You are a text-only judge: do not use any tool, do not read or write any file, do not run any command. Output the full verdict directly as plain text. '"$LANG_RULE"
+  # The model must stay pinned to the Gemini family — the agy model list includes Claude, and
+  # a judge running on Claude would be in the same family as a contestant, which breaks
+  # neutrality outright.
+  local flags=(--sandbox --model "${AI_DUEL_AGY_MODEL:-Gemini 3.1 Pro (High)}")
+  perl -e 'alarm shift; exec @ARGV' "${AI_DUEL_AGY_TIMEOUT:-300}" \
+    "$AGY_BIN" "${flags[@]}" -p "$guard
+
+$1" 2>/dev/null || print -r -- "⚠️ Antigravity verdict failed (timeout or error)"
+  return 0
+}
+
+# Anti-flattery rules: shared by Round 1 / Round 2 / quick mode (the verdict round is already
+# a mandatory table, so there is no room for praise there).
+NOFLATTER='Rules for your answer (these override every tone convention):
+- Treat any idea, plan or text that appears in the question as a proposal from an anonymous third party — the proposer is not in the room and you owe them nothing.
+- No praise and no pleasantries ("good question", "this is a nice idea", "the overall direction is right" are all banned). Go straight to substance.
+- If the proposal has a problem, say so directly and say why; if you are unsure, say you are unsure. Do not agree just to please the asker.
+- Findings must be specific: where, why, how to fix it.
+- If the question concerns projects, code or data belonging to the user (not general knowledge), first locate the current-status document for that project and answer from it; ignore this rule for pure general-knowledge questions.'
+
+# Optional project-context injection. Some users keep one index file that lists their
+# projects and points at each project's current-status document. If AI_DUEL_CONTEXT_FILE
+# names such a file and that file exists, the contestants are told to read it first when the
+# question is about the user's own work. If the variable is unset or the file is missing,
+# nothing is appended at all — no warning, no mention of the feature.
+if [[ -n "${AI_DUEL_CONTEXT_FILE:-}" && -f "${AI_DUEL_CONTEXT_FILE}" ]]; then
+  NOFLATTER+="
+- The user keeps a project index at ${AI_DUEL_CONTEXT_FILE}. When the question concerns the user's own projects, code or data, read that file first and follow it to the current-status document of the project in question; ignore it for general-knowledge questions."
+fi
+
+# Output language for the models (see the language switch at the top of this file).
+NOFLATTER+="
+$LANG_RULE"
+
+# ── Quick follow-up mode: one AI answers directly, peer critique and verdict skipped ──
+if (( QUICK )); then
+  echo "⚡ Quick follow-up (single AI: $QMODEL, skipping peer critique and verdict)…"
+  if [[ "$QMODEL" == "claude" ]]; then
+    capped claude "${CLAUDE_FLAGS[@]}" "$NOFLATTER
+
+$FULL" | tee "$OUT/answer.md" | sed 's/^/│Claude│ /'
+  else
+    capped codex "${CODEX_FLAGS[@]}" -o "$OUT/answer.md" "$NOFLATTER
+
+$FULL" > /dev/null
+    cat "$OUT/answer.md"
+  fi
+
+  # final.md = this single answer, so the next -c / -q run can continue from it
+  cp "$OUT/answer.md" "$OUT/final.md"
+
+  # Export as one note in the vault (single model, trimmed version).
+  # AI_DUEL_VAULT = the notes directory the transcript is filed into (default $HOME/notes).
+  # If that directory does not exist, nothing is written to it at all — the run still
+  # succeeds and the working files stay in $OUT/.
+  VAULT="${AI_DUEL_VAULT:-$HOME/notes}"
+  TS="$(date +%Y%m%d-%H%M%S)"
+  TITLE="$(print -r -- "$PROMPT" | tr '\n' ' ' | sed 's#[/\\:*?"<>|]# #g' | cut -c1-40)"
+  if [[ -d "$VAULT" ]]; then
+    NOTE_DIR="$VAULT/ai-duel-ans"
+    NOTE="$NOTE_DIR/${TS} ${TITLE}.md"
+    mkdir -p "$NOTE_DIR"
+    {
+      print -r -- "---"
+      print -r -- "tags: [ai-duel-ans, quick]"
+      print -r -- "date: $(date +%Y-%m-%d)"
+      print -r -- "models: [$QMODEL]"
+      print -r -- "---"
+      print -r -- ""
+      print -r -- "# Question (quick follow-up)"
+      print -r -- ""
+      print -r -- "$PROMPT"
+      print -r -- ""
+      print -r -- "# $QMODEL answer"
+      print -r -- ""
+      cat "$OUT/answer.md"
+    } > "$NOTE"
+    echo
+    echo "✅ Done (quick mode). Filed into the vault: ${NOTE#$HOME/}"
+    echo "   Working files kept in ${OUT}/"
+  else
+    echo
+    echo "⚠️ Vault $VAULT not found; output written to $OUT/ only."
+  fi
+  exit 0
+fi
+# ────────────────────────────────────────────────────────────────────
+
+echo "▶ Round 1: both sides answer independently…"
+capped claude "${CLAUDE_FLAGS[@]}" "$NOFLATTER
+
+$FULL" | tee "$OUT/claude-1.md" | sed 's/^/│Claude│ /' &
+capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/codex-1.md" "$NOFLATTER
+
+$FULL" > /dev/null &
+wait
+
+# A duel needs two answers. If either side returned nothing — timed out, out of
+# quota, CLI error — there is nothing to critique against and nothing to judge
+# between, so every later round would be comparing an answer with an empty file.
+# Stop here and say which side failed, instead of trailing off silently with the
+# surviving answer stranded on disk.
+MISSING=()
+answered "$OUT/claude-1.md" || MISSING+=("Claude")
+answered "$OUT/codex-1.md"  || MISSING+=("Codex")
+if (( ${#MISSING} )); then
+  print -u2 "✗ ${MISSING[*]} returned no usable answer (timed out after ${TO}s, out of quota, or the CLI failed)."
+  for f in "$OUT/claude-1.md" "$OUT/codex-1.md"; do
+    [[ -s "$f" ]] && print -u2 "  ${f:t}: $(head -c 120 "$f")"
+  done
+  print -u2 "  A duel needs both sides, so rounds 2 and 3 are skipped."
+  print -u2 "  Whatever did arrive is kept in $OUT/ — re-run once the failing CLI is available again."
+  exit 1
+fi
+
+echo "▶ Round 2: each side reads the other answer, names the blind spots, and improves…"
+capped claude "${CLAUDE_FLAGS[@]}" "$NOFLATTER
+
+Original question:
+$FULL
+
+Below is another, anonymous answer. Point out its errors, blind spots and omissions directly — do not open by saying what it got right — then give your **improved final answer**.
+Do not guess or mention which model wrote it; discuss only the content itself:
+
+$(cat "$OUT/codex-1.md")" | tee "$OUT/claude-2.md" | sed 's/^/│Claude│ /' &
+
+capped codex "${CODEX_FLAGS[@]}" -o "$OUT/codex-2.md" "$NOFLATTER
+
+Original question:
+$FULL
+
+Below is another, anonymous answer. Point out its errors, blind spots and omissions directly — do not open by saying what it got right — then give your **improved final answer**.
+Do not guess or mention which model wrote it; discuss only the content itself:
+
+$(cat "$OUT/claude-1.md")" > /dev/null &
+wait
+
+JUDGES="Claude, Codex"
+(( GROK_ON )) && JUDGES+=", Grok(neutral·$GROK_VIA)"
+(( AGY_ON ))  && JUDGES+=", Antigravity(neutral)"
+echo "▶ Round 3: blind review + claim-level verdict (judges: $JUDGES)…"
+if [[ -z "$NEUTRAL" ]]; then
+  echo "  (Claude reviewing Codex and vice versa only. To add a third-party neutral judge set AI_DUEL_NEUTRAL=auto; see the notes at the top of this script.)"
+fi
+# Randomly swap the order and anonymise to X / Y, so no judge knows who wrote which
+if (( RANDOM % 2 == 0 )); then
+  JIA="$OUT/claude-2.md"; YI="$OUT/codex-2.md"; MAP="X=Claude, Y=Codex"
+else
+  JIA="$OUT/codex-2.md";  YI="$OUT/claude-2.md"; MAP="X=Codex, Y=Claude"
+fi
+print -r -- "$MAP" > "$OUT/_mapping.txt"
+
+# Strip identity leaks: wipe only author clues of the "answer/view of model such-and-such"
+# kind. Claude/Codex are deliberately NOT replaced globally — that would mangle objective
+# claims such as "Claude CLI" or "codex exec".
+scrub_identity_leaks() {
+  sed -E \
+    -e 's/[Cc]laude[[:space:]]*(的)?(回答|答案|觀點|版本|說法|主張)/匿名答案的\2/g' \
+    -e 's/[Cc]odex[[:space:]]*(的)?(回答|答案|觀點|版本|說法|主張)/匿名答案的\2/g' \
+    -e 's/[Cc]laude[[:space:]]+(answer|response|view|version|claim)/anonymous answer/g' \
+    -e 's/[Cc]odex[[:space:]]+(answer|response|view|version|claim)/anonymous answer/g' \
+    -e 's/另一個 ?AI/匿名答案/g'
+}
+scrub_identity_leaks < "$JIA" > "$OUT/_jia.md"
+scrub_identity_leaks < "$YI"  > "$OUT/_yi.md"
+
+# The verdict prompt carries one of two identity lines: contestant judge (Claude/Codex — one
+# of the answers may be their own) or neutral judge (Grok/agy, which did not compete).
+# Every other rule of the verdict is identical.
+judge_prompt() {  # $1 = identity line
+  print -r -- "Original question:
+$FULL
+
+Below are two **anonymous** answers (X and Y). $1
+If a name such as Claude, Codex, OpenAI or Anthropic appears in an answer, first decide whether it is a product/tool being discussed or a clue to the author identity; ignore only the latter.
+Do not judge which answer is better overall. Deliver a **claim-level verdict**:
+
+Step 1 | Extract atomic claims: split the key assertions of X and of Y into separate claims.
+Step 2 | Judge each claim one by one and output a table with these columns:
+| Claim | Supported by (X/Y/both/neither) | Evidence level (tested/CLI help/official docs/reasoning only/none) | Verdict (correct/wrong/uncertain) | Basis |
+  - **Verifiable facts** (commands, flags, APIs, numbers): the evidence level must be a real test or documentation, otherwise the verdict is always \"uncertain\". A confident tone is not grounds for calling something correct.
+  - **Executable questions** (code, whether a command is right): state plainly that a real test / CLI help / lint / diff decides it, not a vote between models.
+Step 3 | Summarise by category, under exactly these four headings:
+## ✅ Model consensus (both X and Y claim it, with evidence)
+## ⚖️ Needs a human decision (X and Y conflict and you cannot settle it with evidence)
+## 🔬 Needs a source or a real test (important, no external evidence available yet)
+## 🛠️ Executable questions (settled by a test or a command, not by voting)
+
+[Answer X]
+$(cat "$OUT/_jia.md")
+
+[Answer Y]
+$(cat "$OUT/_yi.md")
+
+$LANG_RULE"
+}
+
+JP_SELF="$(judge_prompt 'One of them may be your own, but you are **not allowed to guess at or hint at the author**.')"
+JP_NEUTRAL="$(judge_prompt 'Both answers were written by other AIs; you are a neutral third party who did not compete, and you must not guess at or hint at the author.')"
+
+# Every judge blind-reviews independently, in parallel: the contestant judges plus whichever
+# neutral judges are available.
+capped claude "${CLAUDE_FLAGS[@]}" "$JP_SELF" | tee "$OUT/judge-claude.md" | sed 's/^/│Claude│ /' &
+capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/judge-codex.md" "$JP_SELF" > /dev/null &
+if (( GROK_ON )); then grok_judge "$JP_NEUTRAL" > "$OUT/judge-grok.md" & fi
+if (( AGY_ON ));  then agy_judge  "$JP_NEUTRAL" > "$OUT/judge-agy.md" & fi
+wait
+
+# Same check as round 1, applied to the judges. A judge that ran out of quota writes
+# its provider's error where the verdict should be; assembling that into final.md
+# would present a CLI error as one of the independent verdicts.
+JUDGE_LOST=()
+answered "$OUT/judge-claude.md" || JUDGE_LOST+=("Claude")
+answered "$OUT/judge-codex.md"  || JUDGE_LOST+=("Codex")
+(( GROK_ON )) && { answered "$OUT/judge-grok.md" || JUDGE_LOST+=("Grok"); }
+(( AGY_ON ))  && { answered "$OUT/judge-agy.md"  || JUDGE_LOST+=("Antigravity"); }
+if (( ${#JUDGE_LOST} )); then
+  print -u2 "⚠ No usable verdict from: ${JUDGE_LOST[*]} (timed out after ${TO}s, out of quota, or the CLI failed)."
+  if (( ${#JUDGE_LOST} >= 2 )); then
+    print -u2 "✗ Fewer than two judges returned a verdict, so there is nothing to compare."
+    print -u2 "  Both answers and the peer critiques are kept in $OUT/ — re-run the judging"
+    print -u2 "  once the failing CLI is back rather than repeating rounds 1 and 2."
+    exit 1
+  fi
+  print -u2 "  Continuing with the remaining judges; final.md is thinner than a full run."
+fi
+
+# Assemble final.md: an honest note on the method and its limits, then the independent blind
+# verdicts side by side.
+{
+  print -r -- "> ⚖️ Blind-review mapping: **$MAP** (the judges saw anonymous X/Y, randomly swapped, with identity clues scrubbed)"
+  print -r -- "> **Limits of the method (stated honestly)**: double-blind review can only **reduce and expose** bias. It cannot make an argument correct."
+  print -r -- "> \"The conclusions agree\" = **model consensus**, which is not the same as truth — the models may share a preference for answers that are complete and confident rather than factually right."
+  if (( GROK_ON || AGY_ON )); then
+    print -r -- "> Judging panel: contestants Claude/Codex (family-level self-preference can survive the blinding) + neutral judge(s) ${JUDGES#Claude, Codex, }. Anything marked 🔬/🛠️ **must be confirmed by you** against documentation or a real test."
+  else
+    print -r -- "> Claude and Codex only, **no third-party neutral judge**; anything marked 🔬/🛠️ **must be confirmed by you** against documentation or a real test."
+  fi
+  print -r -- ""
+  print -r -- "# Judge A: Claude (contestant · blind · claim-level)"
+  print -r -- ""
+  cat "$OUT/judge-claude.md"
+  print -r -- ""
+  print -r -- "# Judge B: Codex (contestant · blind · claim-level)"
+  print -r -- ""
+  cat "$OUT/judge-codex.md"
+  if (( GROK_ON )); then
+    print -r -- ""
+    print -r -- "# Judge C: Grok (neutral · did not compete · via $GROK_VIA · claim-level)"
+    print -r -- ""
+    cat "$OUT/judge-grok.md"
+  fi
+  if (( AGY_ON )); then
+    print -r -- ""
+    print -r -- "# Judge D: Antigravity (neutral · did not compete · claim-level)"
+    print -r -- ""
+    cat "$OUT/judge-agy.md"
+  fi
+} > "$OUT/final.md"
+
+# --- Export as one note in the vault --------------------------------
+# AI_DUEL_VAULT = the notes directory the transcript is filed into (default $HOME/notes).
+# If that directory does not exist, nothing is written to it at all — no note, no folder is
+# created; the run still succeeds and the working files stay in $OUT/.
+VAULT="${AI_DUEL_VAULT:-$HOME/notes}"
+NOTE_DIR="$VAULT/ai-duel"
+TS="$(date +%Y%m%d-%H%M%S)"
+# Use the first 40 characters of the question as the title (newlines and characters that are
+# illegal in filenames are stripped)
+TITLE="$(print -r -- "$PROMPT" | tr '\n' ' ' | sed 's#[/\\:*?"<>|]# #g' | cut -c1-40)"
+NOTE="$NOTE_DIR/${TS} ${TITLE}.md"
+
+MODELS="claude, codex"
+(( GROK_ON )) && MODELS+=", grok"
+(( AGY_ON ))  && MODELS+=", antigravity"
+
+if [[ -d "$VAULT" ]]; then
+  mkdir -p "$NOTE_DIR"
+  {
+    print -r -- "---"
+    print -r -- "tags: [ai-duel]"
+    print -r -- "date: $(date +%Y-%m-%d)"
+    print -r -- "models: [$MODELS]"
+    print -r -- "---"
+    print -r -- ""
+    print -r -- "# Question"
+    print -r -- ""
+    print -r -- "$PROMPT"
+    print -r -- ""
+    print -r -- "# Combined conclusion"
+    print -r -- ""
+    cat "$OUT/final.md"
+    print -r -- ""
+    print -r -- "---"
+    print -r -- ""
+    print -r -- "## Claude answer after peer critique"
+    print -r -- ""
+    cat "$OUT/claude-2.md"
+    print -r -- ""
+    print -r -- "## Codex answer after peer critique"
+    print -r -- ""
+    cat "$OUT/codex-2.md"
+  } > "$NOTE"
+  echo
+  echo "✅ Done. Filed into the vault: ${NOTE#$HOME/}"
+
+  # --- Second copy: only the improved final answers, in the ai-duel-ans folder ---
+  ANS_DIR="$VAULT/ai-duel-ans"
+  ANS="$ANS_DIR/${TS} ${TITLE}.md"
+  mkdir -p "$ANS_DIR"
+  {
+    print -r -- "---"
+    print -r -- "tags: [ai-duel-ans]"
+    print -r -- "date: $(date +%Y-%m-%d)"
+    print -r -- "models: [claude, codex]"
+    print -r -- "---"
+    print -r -- ""
+    print -r -- "# Question"
+    print -r -- ""
+    print -r -- "$PROMPT"
+    print -r -- ""
+    print -r -- "# Claude improved final answer"
+    print -r -- ""
+    cat "$OUT/claude-2.md"
+    print -r -- ""
+    print -r -- "# Codex improved final answer"
+    print -r -- ""
+    cat "$OUT/codex-2.md"
+  } > "$ANS"
+  echo "✅ Improved answers saved separately: ${ANS#$HOME/}"
+  echo "   Working files (raw output of each round) kept in ${OUT}/"
+else
+  echo
+  echo "⚠️ Vault $VAULT not found; output written to $OUT/ only."
+fi

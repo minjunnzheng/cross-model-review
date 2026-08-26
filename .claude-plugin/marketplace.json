@@ -1,0 +1,24 @@
+{
+  "name": "cross-model-review",
+  "description": "Tamper-evident cross-model review gates for plans, decisions, and manuscripts.",
+  "owner": {
+    "name": "minjunnzheng",
+    "url": "https://github.com/minjunnzheng"
+  },
+  "plugins": [
+    {
+      "name": "cross-model-review",
+      "source": "./",
+      "description": "Tamper-evident cross-model review gates for plans, decisions, and manuscripts: xreview, ai-duel, and ai-review.",
+      "version": "1.0.0",
+      "author": {
+        "name": "minjunnzheng",
+        "url": "https://github.com/minjunnzheng"
+      },
+      "homepage": "https://github.com/minjunnzheng/cross-model-review",
+      "repository": "https://github.com/minjunnzheng/cross-model-review",
+      "license": "MIT",
+      "keywords": ["review", "cross-model", "xreview", "ai-duel", "ai-review"]
+    }
+  ]
+}

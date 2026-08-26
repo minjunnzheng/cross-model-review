@@ -1,0 +1,8 @@
+.DS_Store
+.xreview/
+.ai-duel/
+.ai-review/
+__pycache__/
+*.pyc
+*.swp
+*~

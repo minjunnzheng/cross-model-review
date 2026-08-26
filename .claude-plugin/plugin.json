@@ -1,0 +1,23 @@
+{
+  "name": "cross-model-review",
+  "displayName": "Cross-model Review Gates",
+  "version": "1.0.0",
+  "description": "Tamper-evident cross-model review gates for plans, decisions, and manuscripts: xreview, ai-duel, and ai-review.",
+  "author": {
+    "name": "minjunnzheng",
+    "url": "https://github.com/minjunnzheng"
+  },
+  "homepage": "https://github.com/minjunnzheng/cross-model-review",
+  "repository": "https://github.com/minjunnzheng/cross-model-review",
+  "license": "MIT",
+  "keywords": [
+    "review",
+    "cross-model",
+    "xreview",
+    "ai-duel",
+    "ai-review",
+    "claude",
+    "codex",
+    "grok"
+  ]
+}

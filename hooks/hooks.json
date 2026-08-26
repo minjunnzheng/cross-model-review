@@ -1,0 +1,16 @@
+{
+  "description": "Opt-in Stop hook: require a current hash-bound XREVIEW-PASS or explicit XREVIEW-SKIP final line. Inert until a directory contains .xreview-guard.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/xreview-guard.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
