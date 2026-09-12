@@ -18,7 +18,7 @@ Use a duel when the user explicitly requests a second model or cross-model compa
 
 Answer ordinary comparisons, library choices and local implementation questions directly. Multiple defensible answers, uncertainty, or the phrase "which approach is better" alone do not justify launching multiple models. Use primary sources or a small local check when the question can be settled that way.
 
-Use xreview when a concrete proposal needs revision to consensus or when reviewing an expensive computation or trusted-store write. Do not run a duel merely because xreview was used, and do not automatically add an xreview after a duel has resolved the same decision. New consequential implementation details may still need review under the user's or project's rules. A model verdict does not replace source verification.
+Use xreview when a concrete proposal needs revision to consensus, before an expensive computation, or before substantive AI-generated claims, citations or inferred data enter a trusted knowledge base. Operational records directly matched to tool output or authoritative files need source checks, not automatic cross-model review; preserve their sources and limits. Do not run a duel merely because xreview was used, and do not automatically add an xreview after a duel has resolved the same decision. New consequential implementation details may still need review under the user's or project's rules. A model verdict does not replace source verification.
 
 ## Usage
 

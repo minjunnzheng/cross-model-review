@@ -1,6 +1,6 @@
 ---
 name: xreview
-description: "Cross-model review of a plan, proposal or script in one persistent reviewer session until consensus. Use for an explicit cross-model review request, a major architecture or scientific-method decision before implementation, an expensive computation before launch, or AI-generated content before it enters a trusted reference library, notes or knowledge base. Routine edits, local implementation choices, factual lookups and ordinary comparisons do not trigger this workflow. Use ai-duel for independent alternatives to an unresolved major decision."
+description: "Cross-model review of a plan, proposal or script in one persistent reviewer session until consensus. Use for an explicit cross-model review request, a major architecture or scientific-method decision before implementation, an expensive computation before launch, or substantive AI-generated claims, citations or inferred data before they enter a trusted knowledge base. Directly verified operational records do not trigger review. Routine edits, local implementation choices, factual lookups and ordinary comparisons do not trigger this workflow. Use ai-duel for independent alternatives to an unresolved major decision."
 ---
 
 # xreview — cross-model review loop
@@ -15,11 +15,13 @@ Start a review when the user explicitly requests cross-model review, or before o
 
 - Implementing a major architecture or scientific-method decision whose mistakes would cause substantial downstream rework or invalidate results.
 - Launching an expensive computation.
-- Writing AI-generated claims, citations or data into a trusted reference library, notes or knowledge base.
+- Writing substantive AI-generated claims, citations or inferred data into a trusted reference library, notes or knowledge base.
 
 An ordinary bug fix, bounded refactor, configuration or skill edit, or local implementation choice does not qualify merely because it takes several steps or has multiple reasonable solutions. Handle those tasks directly with checks appropriate to the change. Apply any explicit review requirement in the user's instructions or project rules.
 
 For an unresolved major choice, use ai-duel to compare independent alternatives. For an existing proposal that needs revision and agreement, use xreview. Do not chain both workflows automatically for the same decision; review new consequential changes if they arise. Source verification remains separate: use bibcheck for bibliographic records and check claims and values against their original sources.
+
+Operational records such as commit IDs, file paths, skill counts and test exit results may be recorded after matching them directly to actual tool output or authoritative files. Preserve the source command or path and any failures or limits. Updating such a record does not by itself require cross-model review. Do not extend a passing check into a new claim of correctness, safety or scientific validity; review new substantive claims in a mixed document under the rules above. This exception does not waive explicit review requests, source verification or permissions for the underlying action.
 
 Once review is in scope and authorized, carry out the required work without asking the user to reapprove routine steps. Ask only when a material decision, missing information or execution permission is required.
 
