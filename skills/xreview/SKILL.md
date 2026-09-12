@@ -1,6 +1,6 @@
 ---
 name: xreview
-description: "Cross-model review loop — hand a plan, proposal or script to a different model family (Codex by default; Claude or Grok as alternatives) as the reviewer and trade rounds inside one reviewer session, fixing what should be fixed and pushing back where it is wrong, until both sides genuinely reach consensus; only then is the XREVIEW-PASS marker stamped. Use when the user says 'cross-review this', 'have another model review this', 'get Codex to check this', 'get Grok to review this', 'review it until we agree', 'xreview', or before implementing a non-trivial plan, before an expensive computation run, before writing AI output into any trusted store (reference library, notes, knowledge base), or before a major method or architecture choice. NOT for: one-line changes; plain factual lookups; a one-shot 'who is right' ruling (use ai-duel)."
+description: "Cross-model review of a plan, proposal or script in one persistent reviewer session until consensus. Use for an explicit cross-model review request, a major architecture or scientific-method decision before implementation, an expensive computation before launch, or AI-generated content before it enters a trusted reference library, notes or knowledge base. Routine edits, local implementation choices, factual lookups and ordinary comparisons do not trigger this workflow. Use ai-duel for independent alternatives to an unresolved major decision."
 ---
 
 # xreview — cross-model review loop
@@ -8,6 +8,20 @@ description: "Cross-model review loop — hand a plan, proposal or script to a d
 **You are the author, another model family is the reviewer.** The same head checking its own work always has blind spots; only a different model family, looking at it from the outside, catches them.
 
 Tool: `xreview` (must be on PATH; see the package README). It handles every reviewer call — **do not assemble codex/grok/claude commands yourself**.
+
+## When to use this workflow
+
+Start a review when the user explicitly requests cross-model review, or before one of these consequential actions:
+
+- Implementing a major architecture or scientific-method decision whose mistakes would cause substantial downstream rework or invalidate results.
+- Launching an expensive computation.
+- Writing AI-generated claims, citations or data into a trusted reference library, notes or knowledge base.
+
+An ordinary bug fix, bounded refactor, configuration or skill edit, or local implementation choice does not qualify merely because it takes several steps or has multiple reasonable solutions. Handle those tasks directly with checks appropriate to the change. Apply any explicit review requirement in the user's instructions or project rules.
+
+For an unresolved major choice, use ai-duel to compare independent alternatives. For an existing proposal that needs revision and agreement, use xreview. Do not chain both workflows automatically for the same decision; review new consequential changes if they arise. Source verification remains separate: use bibcheck for bibliographic records and check claims and values against their original sources.
+
+Once review is in scope and authorized, carry out the required work without asking the user to reapprove routine steps. Ask only when a material decision, missing information or execution permission is required.
 
 ## Picking the reviewer
 

@@ -1,6 +1,6 @@
 ---
 name: ai-duel
-description: One-shot cross-model verdict — the same open question goes to Claude and to Codex, each answering cold, then one peer-critique round, then a double-blind claim-level verdict on which answer holds up. Triggers on "ai-duel", "get a second opinion", "ask another model", "what would a different model say", "settle this for me", "which approach is better" — or any design choice with no textbook answer where both paths are defensible. NOT for iterating to consensus (use xreview), fact and literature lookup, poking holes in a piece of writing (use ai-review), or a coding task where two models would edit the same file (isolate them in two git worktrees instead).
+description: "One-shot cross-model comparison: two cold answers, peer critique, then a blind claim-level verdict. Use when the user explicitly requests a second model, second opinion or ai-duel, or when an unresolved major architecture or scientific-method decision warrants independent alternatives. Ordinary comparisons such as \"which approach is better\" and routine local design choices do not trigger a duel by themselves. Use xreview to revise an existing proposal to consensus; use direct sources for factual or literature lookup."
 ---
 
 # ai-duel — one-shot cross-model verdict
@@ -11,6 +11,14 @@ it is over.
 
 Tool: `ai-duel` (must be on PATH; see the package README). It handles every claude and
 codex invocation — **do not assemble those commands yourself.**
+
+## When to use this workflow
+
+Use a duel when the user explicitly requests a second model or cross-model comparison, or when a major architecture or scientific-method decision remains unresolved and a poor choice would cause substantial downstream rework or invalidate results.
+
+Answer ordinary comparisons, library choices and local implementation questions directly. Multiple defensible answers, uncertainty, or the phrase "which approach is better" alone do not justify launching multiple models. Use primary sources or a small local check when the question can be settled that way.
+
+Use xreview when a concrete proposal needs revision to consensus or when reviewing an expensive computation or trusted-store write. Do not run a duel merely because xreview was used, and do not automatically add an xreview after a duel has resolved the same decision. New consequential implementation details may still need review under the user's or project's rules. A model verdict does not replace source verification.
 
 ## Usage
 
