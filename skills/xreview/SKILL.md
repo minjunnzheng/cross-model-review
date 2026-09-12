@@ -23,82 +23,20 @@ For an unresolved major choice, use ai-duel to compare independent alternatives.
 
 Once review is in scope and authorized, carry out the required work without asking the user to reapprove routine steps. Ask only when a material decision, missing information or execution permission is required.
 
-## Picking the reviewer
+## Choose an operation
 
-Default is Codex; the tool refuses to let the author's own family review (`✗ The author is claude, so claude cannot be the reviewer`), so you never need to work out who is running.
+- **Start, resume, resolve findings, or stamp a review:** read [review loop](references/review-loop.md). When starting, also read [reviewer selection](references/reviewers.md); the reviewer must be from a different family. Reuse the existing session for subsequent rounds.
+- **Inspect status:** run `xreview status --session <known-directory>`. Read [command reference](references/commands.md) only for logs, checks or configuration options. A status request does not start a review.
+- **An actual xreview-guard block or guard configuration request:** read [guard behavior](references/guard.md). Do not disable or bypass it to complete an unrelated task.
+- **Visual review:** the review loop requires screenshots of the relevant rendered states before requesting a verdict.
 
-| Reviewer | How | When |
-|---|---|---|
-| Codex (default) | nothing to set | the standing choice — strongest at code, config and plan mechanics |
-| Claude | automatic when the author is Codex; or `--reviewer claude` | Codex is the author, or Codex is out of quota |
-| Grok 4.6 | `xreview start --reviewer grok …` | user asks for Grok; a second opinion after a Codex PASS you distrust; Codex is out of quota |
-
-Pick the engine once, at `start`, as `--reviewer ENGINE[:MODEL]` — e.g. `--reviewer grok:grok-4.6`, `--reviewer claude:opus` (`XREVIEW_REVIEWER` works too; the flag wins). Engine and model are pinned into the session, so `round` and `stamp` need nothing set. Model precedence: `-m`, then `:MODEL`, then the per-engine `XREVIEW_*_MODEL` variables.
+Use `/Users/br/bin/xpane <label> xreview ...` for CLI calls. Review working files belong in the session scratchpad when project rules exclude temporary files from the repo. Use explicit session directories throughout.
 
 ## Why it is shaped this way (do not optimise these away)
 
 1. **The same reviewer thread throughout.** A reviewer that cold-starts every round keeps inventing new small defects, so you never finish fixing -> over-engineering. The same thread remembers what it said last round: round 1 finds the real problems, later rounds sign off on your fixes, and that is what converges. `xreview round` resumes that same thread — do not bypass it.
 2. **No round limit.** A limit forces the worst outcome: on the last round the reviewer pretends there is nothing wrong just to end it. There is exactly one pass criterion — **consensus**.
 3. **The marker is the handshake.** Only a PASS can be stamped; `xreview stamp` refuses every non-PASS verdict and has no force override. The marker is bound to the exact reviewed snapshot, so editing the target after PASS requires another round.
-
-## Flow
-
-### 0. Decide the target and the cwd
-- Plan file already exists -> use that file.
-- Plan still only in the conversation -> write it out as an md file first (project directory or scratchpad), **then** submit it. The reviewer has to be able to re-read the file to see what you changed.
-- **Keep one working directory throughout the review.** `.xreview/` is relative to cwd. Use the session scratchpad when project rules require temporary artifacts outside the repo, and reference project files by absolute path. If the project permits review artifacts inside its repo, exclude `.xreview/` in `.gitignore`.
-
-### 1. Open the review
-```
-xreview start --label <short-name> <plan file>
-xreview start --label ui -i shot-desktop-1440.png -i shot-ipad-1024.png proposal.md
-```
-
-The command prints an absolute session directory. Copy it and either add
-`--session <that-directory>` to every later command or export
-`XREVIEW_SESSION=<that-directory>`. Never guess a session through a shared
-pointer; parallel reviews in one project are supported only because sessions
-are explicit.
-A review may take several minutes without producing a final reply. Silence alone does not mean that it failed.
-
-- Follow the current execution tool's schema and the handle it actually returns. With `exec_command`, resume a running `session_id` using `write_stdin`. With `functions.exec`, use `functions.wait` only after it returns `Script running with cell ID ...`, passing that `cell_id`. These handles are not interchangeable.
-- Keep individual waits within the tool's supported limits and short enough to provide the required progress updates. Continue polling the existing run; do not launch another reviewer merely because a call yielded.
-- If execution state is unclear, run `xreview status --session <dir>`. `RUNNING` means the review is active; `INCOMPLETE` means the round was interrupted and its missing verdict is not a result; `done` means it completed. Report an actual failure or required user action instead of treating silence as a verdict.
-
-**Always attach screenshots for anything visual.** The reviewer can read the source but cannot see the rendered result — with no image it is completely blind to "this block collapses into a heap on iPad". Take shots at desktop width and at the target device width, plus one for each key interaction state; `-i` can be repeated. **The filename is the caption**, so give it a meaningful name (`shot-ipad-1024.png`, `shot-field-form.png`), not `Screenshot 2026-07-30.png`. After fixing, attach the re-taken shots with `xreview round --session <dir> -i new-shot.png -` and it will check them.
-
-### 2. Handle findings point by point (the author's iron rule)
-Every finding has exactly two exits, **a third one is not allowed**:
-
-- **Fix it** -> edit the plan file directly (use Edit, do not just promise it in your reply).
-- **Push back** -> give a concrete reason or evidence and convince the reviewer instead.
-
-Forbidden:
-- Pretending a problem does not exist, glossing over it, or treating "later" as having handled it.
-- Over-engineering the reviewer never asked for, just to get through faster.
-- **Accepting the reviewer's factual claims without checking them.** It will cite the wrong line number and misremember key names. When it says "file X line N is Y", Read/Grep to check first; if it is wrong, push back with the actual content — that is your job, not insubordination.
-- Appending a patch at the end of the file while leaving the contradictory old sentence above it (the reviewer will catch it and you waste a round).
-
-### 3. Send the next round
-Feed long replies from stdin with a heredoc:
-```
-xreview round --session <dir> - <<'EOF'
-Point by point:
-1. <item> -> fixed, see plan item N / file:line
-2. <item> -> pushing back: <reason and evidence>. If you still insist, say exactly what you are insisting on under <assumption>.
-EOF
-```
-`xreview round` attaches the plan file's diff automatically, so you do not need to re-paste the full text.
-
-### 4. Converge
-Repeat steps 2–3 until the verdict is PASS.
-
-**Handling a real deadlock**: the same dispute runs 3 rounds in a row with neither side giving ground and both sides giving concrete reasons -> stop, and hand the user one sentence for each side to decide on. **That is the only legitimate exit** — do not fake consensus to end it.
-
-### 5. Stamp
-```
-xreview stamp --session <dir>
-```
 
 ## How to report to the user
 
@@ -110,30 +48,9 @@ Round N: X findings -> Y fixed, Z pushed back, W unresolved
 
 At the end report: total rounds, which substantive things actually changed (<=5 items), and where it was stamped. Only use `xreview log` when the user wants the details.
 
-## Other commands
-
-| Command | Purpose |
-|---|---|
-| `xreview status --session <dir>` | round count / latest verdict / `state:` = is the round still running, dead, or finished |
-| `xreview log --session <dir>` | print every round in full |
-| `xreview check <file>` | hash-valid final-line XREVIEW-PASS or explicit final-line XREVIEW-SKIP -> exit 0 |
-| `xreview start -` | read the material to review from stdin |
-
-Environment variables: `XREVIEW_REVIEWER` (`codex` | `claude` | `grok`), `XREVIEW_AUTHOR` (explicit author family when harness detection is missing or inherited through a multiplexer), `XREVIEW_CODEX_MODEL` / `XREVIEW_GROK_MODEL` (default `grok-4.6`) / `XREVIEW_CLAUDE_MODEL` (reviewer model, per engine), `XREVIEW_SESSION`, `XREVIEW_TIMEOUT` (per-round timeout, default 900s), and `XREVIEW_ALLOW_SELF=1` (allow same-family review — last resort when only one model CLI is installed).
-
 ## Cost
 
 Use the token usage reported by the actual CLI run. Cost and elapsed time depend on the model, reviewed material, caching and number of rounds; do not quote a fixed per-round estimate. Keep the review material focused on the consequential decision.
-
-## Stop-hook guard (`xreview-guard.py`)
-
-When the guard blocks you, you get an additionalContext block starting `[xreview guard] ... Do not finish up`, listing the plan files that are not stamped — run the flow above as it says, do not work around it.
-
-- The guard **only activates under a directory tree that contains a `.xreview-guard` file** (opt-in). It performs no review of its own, it only knows the marker.
-- Block conditions: the file was touched with Write/Edit in this session, it matches a glob in `.xreview-guard`, and it lacks a current hash-valid PASS or explicit final-line SKIP.
-- An empty `.xreview-guard` file means the built-in globs (`PLAN*.md`, `plan*.md`, `*_PLAN.md`, `*-plan.md` ...); to change the scope, put one glob per line in it.
-- User says a given file does not need review -> write one line `XREVIEW-SKIP <reason>` at the end of that file (the guard accepts that as a human exemption, not as PASS).
-- User says "turn the guard off for now" -> put a single line `off` in `.xreview-guard` (that directory only), or have them `export XREVIEW_GUARD=0` (global).
 
 ## Division of labour with the sibling tools
 
