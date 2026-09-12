@@ -37,7 +37,7 @@ Pick the engine once, at `start`, as `--reviewer ENGINE[:MODEL]` — e.g. `--rev
 
 ## Why it is shaped this way (do not optimise these away)
 
-1. **The same codex thread throughout.** A reviewer that cold-starts every round keeps inventing new small defects, so you never finish fixing -> over-engineering. The same thread remembers what it said last round: round 1 finds the real problems, later rounds sign off on your fixes, and that is what converges. `xreview round` resumes that same thread — do not bypass it.
+1. **The same reviewer thread throughout.** A reviewer that cold-starts every round keeps inventing new small defects, so you never finish fixing -> over-engineering. The same thread remembers what it said last round: round 1 finds the real problems, later rounds sign off on your fixes, and that is what converges. `xreview round` resumes that same thread — do not bypass it.
 2. **No round limit.** A limit forces the worst outcome: on the last round the reviewer pretends there is nothing wrong just to end it. There is exactly one pass criterion — **consensus**.
 3. **The marker is the handshake.** Only a PASS can be stamped; `xreview stamp` refuses every non-PASS verdict and has no force override. The marker is bound to the exact reviewed snapshot, so editing the target after PASS requires another round.
 
@@ -46,7 +46,7 @@ Pick the engine once, at `start`, as `--reviewer ENGINE[:MODEL]` — e.g. `--rev
 ### 0. Decide the target and the cwd
 - Plan file already exists -> use that file.
 - Plan still only in the conversation -> write it out as an md file first (project directory or scratchpad), **then** submit it. The reviewer has to be able to re-read the file to see what you changed.
-- **Keep cwd fixed at the project root**: the `.xreview/` state directory is relative to cwd, so changing directory mid-loop loses the session. (Inside a git repo, add `.xreview/` to `.gitignore`.)
+- **Keep one working directory throughout the review.** `.xreview/` is relative to cwd. Use the session scratchpad when project rules require temporary artifacts outside the repo, and reference project files by absolute path. If the project permits review artifacts inside its repo, exclude `.xreview/` in `.gitignore`.
 
 ### 1. Open the review
 ```
@@ -59,11 +59,11 @@ The command prints an absolute session directory. Copy it and either add
 `XREVIEW_SESSION=<that-directory>`. Never guess a session through a shared
 pointer; parallel reviews in one project are supported only because sessions
 are explicit.
-Round 1 takes **3–15 minutes and prints nothing until it returns** — the reviewer has read-only file access and spends that time reading the source and data files you cite.
+A review may take several minutes without producing a final reply. Silence alone does not mean that it failed.
 
-> **Never abandon a round in flight.** A silent, long-running command looks exactly like a failed one. In Codex, `exec_command` comes back with `Script running with cell ID N` once `yield_time_ms` elapses — **that means it is still running**: poll the same cell (or pass a `yield_time_ms` of 900000) until it really completes. Never start a second session, and never switch reviewer engine, because the first one "returned nothing".
->
-> If you are unsure, run `xreview status --session <dir>` and read the `state:` line — `RUNNING` = alive, keep waiting; `INCOMPLETE` = the process was killed mid-round, so the blank verdict is **not** a review result; `done` = what you see is the real verdict. Abandoning a silent round at ~10 s and re-firing it costs twice as much and produces nothing.
+- Follow the current execution tool's schema and the handle it actually returns. With `exec_command`, resume a running `session_id` using `write_stdin`. With `functions.exec`, use `functions.wait` only after it returns `Script running with cell ID ...`, passing that `cell_id`. These handles are not interchangeable.
+- Keep individual waits within the tool's supported limits and short enough to provide the required progress updates. Continue polling the existing run; do not launch another reviewer merely because a call yielded.
+- If execution state is unclear, run `xreview status --session <dir>`. `RUNNING` means the review is active; `INCOMPLETE` means the round was interrupted and its missing verdict is not a result; `done` means it completed. Report an actual failure or required user action instead of treating silence as a verdict.
 
 **Always attach screenshots for anything visual.** The reviewer can read the source but cannot see the rendered result — with no image it is completely blind to "this block collapses into a heap on iPad". Take shots at desktop width and at the target device width, plus one for each key interaction state; `-i` can be repeated. **The filename is the caption**, so give it a meaningful name (`shot-ipad-1024.png`, `shot-field-form.png`), not `Screenshot 2026-07-30.png`. After fixing, attach the re-taken shots with `xreview round --session <dir> -i new-shot.png -` and it will check them.
 
@@ -91,7 +91,7 @@ EOF
 `xreview round` attaches the plan file's diff automatically, so you do not need to re-paste the full text.
 
 ### 4. Converge
-Repeat 2–3 until the verdict is PASS. Typically 3–5 rounds.
+Repeat steps 2–3 until the verdict is PASS.
 
 **Handling a real deadlock**: the same dispute runs 3 rounds in a row with neither side giving ground and both sides giving concrete reasons -> stop, and hand the user one sentence for each side to decide on. **That is the only legitimate exit** — do not fake consensus to end it.
 
@@ -102,7 +102,7 @@ xreview stamp --session <dir>
 
 ## How to report to the user
 
-The user's job is to sit there and wait while the two of you argue — do not paste every round's full text at them. One line per round:
+Summarize each round without pasting the full transcript. One line per round:
 
 ```
 Round N: X findings -> Y fixed, Z pushed back, W unresolved
@@ -123,7 +123,7 @@ Environment variables: `XREVIEW_REVIEWER` (`codex` | `claude` | `grok`), `XREVIE
 
 ## Cost
 
-Each round the reviewer reads a fair number of files: roughly 1–2M input tokens (mostly cache hits) and ~20k output. Four rounds is the same order of magnitude as one full code review — cheaper than debugging it afterwards, but do not use it to review a one-line change.
+Use the token usage reported by the actual CLI run. Cost and elapsed time depend on the model, reviewed material, caching and number of rounds; do not quote a fixed per-round estimate. Keep the review material focused on the consequential decision.
 
 ## Stop-hook guard (`xreview-guard.py`)
 

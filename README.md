@@ -64,17 +64,23 @@ cd cross-model-review
 #                       # (only useful if you also run Claude Code; see the Stop hook section)
 ```
 
-`~/bin` must be on PATH. Codex reads `~/.codex/skills/<name>/` as a real
-directory containing a real `SKILL.md` (a file-level symlink of
-`SKILL.md` is silently ignored). Grok and other Agent Skills harnesses
-read `~/.agents/skills/`. Open a new session and type `/` to confirm the
-three skills appear.
+`~/bin` must be on PATH. Codex supports skills in `~/.agents/skills/`
+and directory symlinks; this installer also retains `~/.codex/skills/`
+for compatibility. Keep `SKILL.md` as a real file in the source folder
+when sharing it through directory links. Grok and other Agent Skills
+harnesses read `~/.agents/skills/`. Open a new session and confirm the
+three skills appear in each harness you use.
 
 The installer checks every destination before its first write. A differing
 file or a skill directory with stale entries stops the whole install without
 partial changes. `./install.sh --replace` explicitly moves conflicts into a
 timestamped backup under `~/.local/state/cross-model-review/backups/` before
 installing exact copies.
+
+A skill-directory symlink resolving to the matching `skills/<name>` in this
+checkout is already up to date and is preserved on reinstall. Links to other
+locations still count as conflicts. Edit the source in this checkout when using
+these links; keep the checkout at the same path.
 
 ---
 
@@ -272,7 +278,7 @@ that produced PASS. The final marker stores that snapshot's SHA-256 digest;
 `xreview check` and the Stop hook reject later edits. There is no force-PASS
 option.
 
-A round takes **3–15 minutes and prints nothing until it returns**. Do
+A round may run for several minutes without a final reply. Do
 not abandon it and start a replacement session. `xreview status --session
 <run-directory>` reports `RUNNING` / `INCOMPLETE` / `done`.
 

@@ -52,6 +52,8 @@ same_path() {
   local src="$1" dest="$2" kind="${3:-}"
   if [[ -f "$src" && -f "$dest" && ! -L "$dest" ]]; then
     cmp -s "$src" "$dest" && { [[ "$kind" != executable ]] || [[ -x "$dest" ]]; }
+  elif [[ "$kind" == directory && -d "$src" && -L "$dest" && "${src:A}" == "${dest:A}" ]]; then
+    return 0
   elif [[ -d "$src" && -d "$dest" && ! -L "$dest" ]]; then
     diff -qr "$src" "$dest" > /dev/null 2>&1
   else
