@@ -484,6 +484,9 @@ engine_start_codex() {
 engine_resume_codex() {
   local eff="$1" thread="$2"; shift 3   # exec resume has no -s; -c spells the same sandbox
   CALL=(codex exec resume "$thread" --skip-git-repo-check -c sandbox_mode="read-only" --json)
+  # Resume must repeat the pinned model; without -m codex falls back to its config default,
+  # which may differ from (or not be available like) the model the thread started with.
+  [[ -n "$eff" ]] && CALL+=(-m "$eff")
   local f; for f in "$@"; do CALL+=(-i "$f"); done
   CALL+=(-)
 }
