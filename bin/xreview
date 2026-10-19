@@ -41,7 +41,7 @@
 #     XREVIEW_AUTHOR        explicit author family: codex | claude | grok (overrides detection)
 #     XREVIEW_CODEX_MODEL   reviewer model when the reviewer is codex (default: codex's own)
 #     XREVIEW_CLAUDE_MODEL  reviewer model when the reviewer is claude (default: opus)
-#     XREVIEW_GROK_MODEL    reviewer model when the reviewer is grok (default: grok-4.6)
+#     XREVIEW_GROK_MODEL    reviewer model when the reviewer is grok (default: grok-4.7)
 #     XREVIEW_TIMEOUT       per-round timeout in seconds (default 900)
 #     XREVIEW_SESSION       session directory to use instead of --session
 #     XREVIEW_LANG          language the reviewer answers in (falls back to AI_LANG; default en)
@@ -454,7 +454,7 @@ eff_model() {
     if [[ "$REVIEWER" == claude ]]; then
       m="${XREVIEW_CLAUDE_MODEL:-opus}"
     elif [[ "$REVIEWER" == grok ]]; then
-      m="${XREVIEW_GROK_MODEL:-grok-4.6}"
+      m="${XREVIEW_GROK_MODEL:-grok-4.7}"
     else
       m="$(grep -m1 '^model[[:space:]]*=' "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null \
            | sed -e 's/^[^=]*=[[:space:]]*//' -e 's/"//g' -e "s/'//g" || true)"

@@ -182,7 +182,7 @@ grok_judge() {  # $1 = verdict prompt; stdout = the verdict text
       "$GROK_BIN" "${flags[@]}" 2>/dev/null || print -r -- "⚠️ Grok CLI verdict failed (timeout or error)"
     return 0
   fi
-  local model="${AI_DUEL_GROK_MODEL:-${GROK_MODEL:-grok-4.6}}"
+  local model="${AI_DUEL_GROK_MODEL:-${GROK_MODEL:-grok-4.7}}"
   local cfg payload resp content
   cfg="$(mktemp)" && chmod 600 "$cfg"
   print -r -- "header = \"Authorization: Bearer $XAI_API_KEY\"" > "$cfg"
