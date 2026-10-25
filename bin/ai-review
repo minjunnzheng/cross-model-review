@@ -122,9 +122,9 @@ else
 #    the two model families ──────────────────────────────────────────────────
 echo "▶ Round 1: four reviewers in parallel (anonymous submission, praise banned)…"
 capped claude "${CLAUDE_FLAGS[@]}" "$(mk_prompt "$L_LOGIC")"  > "$OUT/critic-logic.md"  &
-capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/critic-fact.md"   "$(mk_prompt "$L_FACT")"   > /dev/null &
+capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/critic-fact.md"   "$(mk_prompt "$L_FACT")"   > /dev/null 2>>"$OUT/codex.err" &
 capped claude "${CLAUDE_FLAGS[@]}" "$(mk_prompt "$L_STYLE")"  > "$OUT/critic-style.md"  &
-capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/critic-reader.md" "$(mk_prompt "$L_READER")" > /dev/null &
+capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/critic-reader.md" "$(mk_prompt "$L_READER")" > /dev/null 2>>"$OUT/codex.err" &
 wait
 
 # Decide which lenses actually delivered a review.
@@ -185,7 +185,7 @@ $TEXT
 $ALL_CRIT"
 
 capped claude "${CLAUDE_FLAGS[@]}" "$REFUTE_PROMPT" > "$OUT/verify-a.md" &
-capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/verify-b.md" "$REFUTE_PROMPT" > /dev/null &
+capped codex  "${CODEX_FLAGS[@]}" -o "$OUT/verify-b.md" "$REFUTE_PROMPT" > /dev/null 2>>"$OUT/codex.err" &
 wait
 
 # Same failure mode as the lenses: a checker that timed out or ran out of quota
@@ -207,7 +207,7 @@ capped claude "${CLAUDE_FLAGS[@]}" "You are the editor. You have: the original a
 - Delete outright any finding both checkers marked 'rejected'; do not mention it.
 - Keep any finding at least one checker marked 'upheld'; where the two calibrations conflict, or where a finding was marked 'overstated', keep it but drop its severity by one level and tag it ⚖️.
 - Sort by severity (high → medium → low), keeping [LOCATION] [PROBLEM] [FIX] for each finding.
-- Put upheld findings tagged [VERIFY-…] in a separate list headed \"Author must verify\", after the main findings. In Part 2 do not rewrite those passages; mark each one as [TODO: verify …].
+- Put kept findings tagged [VERIFY-…] in a separate list headed \"Author must verify\", after the main findings. In Part 2 do not rewrite those passages; mark each one as [TODO: verify …].
 - First line: the overall verdict (ACCEPT / MINOR REVISION / MAJOR REVISION / REJECT). Praise and pleasantries are banned here too.
 
 # Part 2: revised full text
