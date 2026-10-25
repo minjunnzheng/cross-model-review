@@ -36,6 +36,12 @@ Forbidden:
 - **Accepting the reviewer's factual claims without checking them.** It will cite the wrong line number and misremember key names. When it says "file X line N is Y", Read/Grep to check first; if it is wrong, push back with the actual content — that is your job, not insubordination.
 - Appending a patch at the end of the file while leaving the contradictory old sentence above it (the reviewer will catch it and you waste a round).
 
+### 2b. A bare PASS is not a review
+- End every plan you submit with a fixed section, "Reviewer: answer point by point (do not reply with PASS alone)", that lists 5–8 concrete questions the reviewer must check independently (equivalence, initialisation order, omissions, whether the tests actually exercise the change...).
+- If the reviewer replies only `VERDICT: PASS` without answering point by point, **do not stamp**. Send another round at once and ask, for each point: (a) the files and line numbers it actually inspected; (b) agree / disagree / agree with conditions; (c) the reason or a counterexample. Also name 3–5 checks it must redo independently instead of taking the plan's word for them.
+- If it again returns only a verdict, ask once more and list the minimum checks by letter (A, B, C...).
+- When the point-by-point answers include factual corrections, check them against the source first; if they hold, revise the plan, send one more round to confirm, and only then stamp.
+
 ### 3. Send the next round
 Feed long replies from stdin with a heredoc:
 ```
