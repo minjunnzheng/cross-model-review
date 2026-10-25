@@ -32,7 +32,7 @@ Once review is in scope and authorized, carry out the required work without aski
 - **An actual xreview-guard block or guard configuration request:** read [guard behavior](references/guard.md). Do not disable or bypass it to complete an unrelated task.
 - **Visual review:** the review loop requires screenshots of the relevant rendered states before requesting a verdict.
 
-Use `/Users/br/bin/xpane <label> xreview ...` for CLI calls. Review working files belong in the session scratchpad when project rules exclude temporary files from the repo. Use explicit session directories throughout.
+If your environment runs cross-model CLIs through a wrapper (for example one that shows them in a visible terminal pane), call `xreview` through that wrapper. Review working files belong in the session scratchpad when project rules exclude temporary files from the repo. Use explicit session directories throughout.
 
 ## Why it is shaped this way (do not optimise these away)
 
