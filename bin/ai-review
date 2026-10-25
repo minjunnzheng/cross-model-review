@@ -85,8 +85,8 @@ Hard rules:
 5. Last line, the verdict: "VERDICT: ACCEPT / MINOR REVISION / MAJOR REVISION / REJECT — one sentence on the main reason".
 When you quote the original text, keep the quote in the language it was written in.'
 
-L_LOGIC='You cover [ARGUMENT AND STRUCTURE]: whether claims are supported by evidence, whether the reasoning skips steps, whether the order of the sections actually supports the conclusion, whether the text contradicts itself, whether key concepts are used before they are defined.'
-L_FACT='You cover [CONTENT AND FACTS]: factual errors and out-of-date statements, assertions that need a citation or data to back them and have none, whether numbers and units are correct, generalising from too little evidence or stretching a result too far. If the article concerns a project, tool or dataset belonging to the author, first locate the current-status document for that project and use it to check whether the facts in the article are stale.'
+L_LOGIC='You cover [ARGUMENT AND STRUCTURE]: whether claims are supported by evidence, whether the reasoning skips steps, whether the order of the sections actually supports the conclusion, whether the text contradicts itself, whether key concepts are used before they are defined. Also flag every result the text presents as surprising, unexpected or contrary to expectation: a surprise is also the typical signature of a code bug or a mis-set input. If the text does not say how the result was reproduced or ruled out as an artefact, report it with [PROBLEM] starting with the tag [VERIFY-ARTEFACT].'
+L_FACT='You cover [CONTENT AND FACTS]: factual errors and out-of-date statements, assertions that need a citation or data to back them and have none, whether numbers and units are correct, generalising from too little evidence or stretching a result too far. If the article concerns a project, tool or dataset belonging to the author, first locate the current-status document for that project and use it to check whether the facts in the article are stale. Also audit every claim that rests on a citation or a number. For each doubtful one, start [PROBLEM] with one tag: [VERIFY-SOURCE] the cited work probably studies a different region, method, sample or scale than the claim says; [VERIFY-OVERCLAIM] the text states more than such a source usually supports ("shows" for "suggests", one case generalised); [VERIFY-PARTIAL] one citation carries several sub-claims — name the sub-claim it is unlikely to cover; [VERIFY-UNCITED] a factual or numerical assertion with no citation and no stated data source; [VERIFY-PROVENANCE] a reported number, model parameter or result that the text does not tie to a data file, run or table. You cannot see the sources or the runs: do not say the claim is false, say what the author must check.'
 L_STYLE='You cover [WORDING AND EXPRESSION]: padding, vagueness, terminology that changes from one section to the next, sentences that carry no information, over-long paragraphs, headings that do not match the text under them.'
 L_READER='You cover [THE READER VIEW]: assume you are the target reader of this article — where do you stop following it, where do you lose patience, which key question is never answered, are you convinced once you have finished? If you are not convinced, what is missing?'
 
@@ -174,6 +174,7 @@ Calibration rules:
 - upheld     = the original text really does have this problem, and the suggested fix is workable.
 - overstated = there is something to it, but the severity is inflated, or the suggested fix goes too far.
 - rejected   = the original text does not have this problem, or the finding misread the original text.
+- Findings tagged [VERIFY-…] ask the author to check something you cannot see either. Judge only whether the original text really makes the claim as quoted and gives no source or evidence for it; do not reject them because you cannot confirm the problem.
 You are on neither the reviewers' side nor the author's side. The original text is your only evidence.
 $LANG_RULE
 
@@ -206,6 +207,7 @@ capped claude "${CLAUDE_FLAGS[@]}" "You are the editor. You have: the original a
 - Delete outright any finding both checkers marked 'rejected'; do not mention it.
 - Keep any finding at least one checker marked 'upheld'; where the two calibrations conflict, or where a finding was marked 'overstated', keep it but drop its severity by one level and tag it ⚖️.
 - Sort by severity (high → medium → low), keeping [LOCATION] [PROBLEM] [FIX] for each finding.
+- Put upheld findings tagged [VERIFY-…] in a separate list headed \"Author must verify\", after the main findings. In Part 2 do not rewrite those passages; mark each one as [TODO: verify …].
 - First line: the overall verdict (ACCEPT / MINOR REVISION / MAJOR REVISION / REJECT). Praise and pleasantries are banned here too.
 
 # Part 2: revised full text

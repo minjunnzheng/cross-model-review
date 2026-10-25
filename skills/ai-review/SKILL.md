@@ -47,6 +47,10 @@ Lead with the tally: how many findings, how many upheld, how many overstated or
 rejected. Then list **only the upheld ones**, one per line. Do not paste all four
 lenses' raw output.
 
+List the "Author must verify" items as a separate block after the upheld
+findings. They are not errors yet — they are checks the author must run against
+the sources or the run records.
+
 The revised draft and every round's raw output land in `.ai-review/<timestamp>/`
 under the current directory; the script prints the path.
 
